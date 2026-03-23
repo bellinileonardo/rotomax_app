@@ -18,6 +18,8 @@ import hashlib
 import os
 import random
 import difflib
+import numpy as np
+from sklearn.cluster import DBSCAN, KMeans
 from urllib.parse import quote
 from typing import Optional
 from pdf2image import convert_from_bytes
@@ -245,6 +247,14 @@ def get_osrm_distance_value(c1: dict, c2: dict) -> float:
         pass
     return haversine_m(c1, c2)
 
+def get_street_info(addr: str):
+    """Extrai (nome_rua_normalizado, numero) para comparação lógica."""
+    # Regex para pegar "Rua Nome, 123" ou "Rua Nome, nº 123"
+    match = re.search(r'^([^,]+),\s*(?:nº|num|number)?\s*(\d+)', addr, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().lower(), int(match.group(2))
+    return None, None
+
 def cluster_points(points: list, threshold_m: float = 100.0) -> list:
     """
     Group points within `threshold_m` metres together.
@@ -252,14 +262,6 @@ def cluster_points(points: list, threshold_m: float = 100.0) -> list:
     """
     visited = [False] * len(points)
     clusters = []
-
-    def get_street_info(addr: str):
-        """Extrai (nome_rua_normalizado, numero) para comparação lógica."""
-        # Regex para pegar "Rua Nome, 123"
-        match = re.search(r'^([^,]+),\s*(\d+)', addr)
-        if match:
-            return match.group(1).strip().lower(), int(match.group(2))
-        return None, None
 
     for i in range(len(points)):
         if visited[i]:
@@ -293,6 +295,82 @@ def cluster_points(points: list, threshold_m: float = 100.0) -> list:
         })
     return clusters
 
+def cluster_points_dbscan(points: list, eps_m: float = 100.0, min_samples: int = 2) -> list:
+    """
+    Agrupamento baseado em densidade (DBSCAN) com matriz de distância customizada.
+    Respeita a regra de numeração de rua (>100).
+    """
+    n = len(points)
+    if n == 0: return []
+
+    # Pre-computa informações de rua
+    street_infos = [get_street_info(p["address"]) for p in points]
+    
+    # Constrói matriz de distância
+    dist_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = haversine_m(points[i]["coords"], points[j]["coords"])
+            
+            # Aplica penalidade se violar regra de numeração de rua
+            s_i, n_i = street_infos[i]
+            s_j, n_j = street_infos[j]
+            if s_i and s_j and s_i == s_j and n_i is not None and n_j is not None and abs(n_i - n_j) > 100:
+                d = 1e6 # Infinito
+
+            dist_matrix[i, j] = dist_matrix[j, i] = d
+
+    # Executa DBSCAN
+    db = DBSCAN(eps=eps_m, min_samples=min_samples, metric='precomputed')
+    labels = db.fit_predict(dist_matrix)
+    
+    clusters = []
+    unique_labels = set(labels)
+    for lbl in unique_labels:
+        if lbl == -1:
+            # Ruído (Noise) -> vira cluster individual
+            noise_indices = [i for i, x in enumerate(labels) if x == -1]
+            for idx in noise_indices:
+                clusters.append({
+                    "centroid": points[idx]["coords"],
+                    "members": [points[idx]],
+                    "is_cluster": False
+                })
+        else:
+            indices = [i for i, x in enumerate(labels) if x == lbl]
+            group = [points[i] for i in indices]
+            
+            avg_lat = sum(p["coords"]["lat"] for p in group) / len(group)
+            avg_lng = sum(p["coords"]["lng"] for p in group) / len(group)
+            
+            clusters.append({
+                "centroid": {"lat": avg_lat, "lng": avg_lng},
+                "members": group,
+                "is_cluster": len(group) > 1
+            })
+    return clusters
+
+def cluster_points_kmeans(points: list, k: int) -> list:
+    """Agrupamento K-Means simples baseado em coordenadas."""
+    if not points: return []
+    if k > len(points): k = len(points)
+    
+    X = np.array([[p["coords"]["lat"], p["coords"]["lng"]] for p in points])
+    kmeans = KMeans(n_clusters=k, n_init=10)
+    labels = kmeans.fit_predict(X)
+    
+    clusters = []
+    for lbl in range(k):
+        indices = [i for i, x in enumerate(labels) if x == lbl]
+        if not indices: continue
+        group = [points[i] for i in indices]
+        center = kmeans.cluster_centers_[lbl]
+        clusters.append({
+            "centroid": {"lat": center[0], "lng": center[1]},
+            "members": group,
+            "is_cluster": len(group) > 1
+        })
+    return clusters
 
 def solve_tsp_nn(origin: dict, clusters: list) -> list:
     """Nearest-Neighbour heuristic for TSP. Returns ordered list of clusters."""
@@ -314,6 +392,13 @@ def total_distance_km(origin: dict, stops: list) -> float:
         dist += haversine_m(prev, s["centroid"])
         prev = s["centroid"]
     return dist / 1000
+
+def get_cargo_zone(stop_idx: int) -> str:
+    """Define a zona de carregamento baseada na ordem de entrega (Lógica do car_load.py)."""
+    if 1 <= stop_idx <= 8: return "Banco Carona"
+    elif 9 <= stop_idx <= 20: return "Banco Traseiro"
+    elif 21 <= stop_idx <= 34: return "Porta-malas (Meio)"
+    else: return "Porta-malas (Fundo)"
 
 def expand_multi_addresses(raw_list: list[str]) -> list[str]:
     """
@@ -937,8 +1022,22 @@ with st.sidebar:
 
     # ── CLUSTERING THRESHOLD ─────────────────────────────────────────────────
     st.markdown('<div class="card-title">Parâmetros</div>', unsafe_allow_html=True)
-    cluster_thresh = st.slider("Raio de agrupamento (metros)", 25, 200, 50, 10)
-
+    
+    clustering_algo = st.selectbox("Algoritmo de Agrupamento", ["Simples (Greedy)", "DBSCAN", "K-Means"])
+    
+    cluster_thresh = 50
+    min_samples = 2
+    kmeans_k = 5
+    
+    if clustering_algo == "Simples (Greedy)":
+        cluster_thresh = st.slider("Raio de agrupamento (metros)", 25, 200, 50, 10)
+    elif clustering_algo == "DBSCAN":
+        cluster_thresh = st.slider("Raio (eps) metros", 25, 200, 50, 10)
+        min_samples = st.slider("Mínimo de Pontos (MinPts)", 1, 5, 2)
+    elif clustering_algo == "K-Means":
+        max_k = len(st.session_state.addresses) if st.session_state.addresses else 10
+        kmeans_k = st.slider("Número de Paradas (K)", 1, max(2, max_k), max(1, max_k//3))
+    
     st.divider()
 
     # ── ADDRESS LIST ─────────────────────────────────────────────────────────
@@ -1240,7 +1339,12 @@ with tab_route:
         else:
             # Step 2: cluster
             with st.spinner("Agrupando paradas próximas…"):
-                clusters = cluster_points(valid_points, threshold_m=cluster_thresh)
+                if clustering_algo == "DBSCAN":
+                    clusters = cluster_points_dbscan(valid_points, eps_m=cluster_thresh, min_samples=min_samples)
+                elif clustering_algo == "K-Means":
+                    clusters = cluster_points_kmeans(valid_points, k=kmeans_k)
+                else:
+                    clusters = cluster_points(valid_points, threshold_m=cluster_thresh)
 
             # Step 3: TSP
             with st.spinner("Calculando rota TSP…"):
@@ -1344,7 +1448,14 @@ with tab_route:
                         
                         # Recalcula Cluster e TSP (sem geocodificar tudo de novo)
                         valid_points_refresh = [p for p in st.session_state.geocoded_points if p.get("type") != "error"]
-                        clusters = cluster_points(valid_points_refresh, threshold_m=cluster_thresh)
+                        
+                        if clustering_algo == "DBSCAN":
+                            clusters = cluster_points_dbscan(valid_points_refresh, eps_m=cluster_thresh, min_samples=min_samples)
+                        elif clustering_algo == "K-Means":
+                            clusters = cluster_points_kmeans(valid_points_refresh, k=kmeans_k)
+                        else:
+                            clusters = cluster_points(valid_points_refresh, threshold_m=cluster_thresh)
+                            
                         st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, clusters)
                         st.rerun()
 
@@ -1418,12 +1529,24 @@ with tab_route:
                                     "display": st.session_state.geocoded_points[closest_idx].get("display")
                                 }})
                                 
-                                st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, 
-                                                                    cluster_points(st.session_state.geocoded_points, cluster_thresh))
+                                # Recalcula cluster
+                                if clustering_algo == "DBSCAN":
+                                    new_clusters = cluster_points_dbscan(st.session_state.geocoded_points, eps_m=cluster_thresh, min_samples=min_samples)
+                                elif clustering_algo == "K-Means":
+                                    new_clusters = cluster_points_kmeans(st.session_state.geocoded_points, k=kmeans_k)
+                                else:
+                                    new_clusters = cluster_points(st.session_state.geocoded_points, threshold_m=cluster_thresh)
+
+                                st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, new_clusters)
                                 st.rerun()
 
         with list_col:
             st.markdown("#### 📋 Lista de Paradas")
+            
+            # Input opcional para cálculo de itens por parada
+            total_vols = st.number_input("Total de Volumes (Opcional)", min_value=1, value=len(stops), help="Para calcular média de itens por parada")
+            items_per_stop = math.ceil(total_vols / len(stops))
+
             for i, stop in enumerate(stops, start=1):
                 badge_class = "cluster" if stop["is_cluster"] else ""
                 tag = "📦 Agrupada" if stop["is_cluster"] else "📍 Individual"
@@ -1434,8 +1557,15 @@ with tab_route:
                     else:
                         members_items.append(f'<div class="addr-sub">{m["address"]}</div>')
                 members_html = "".join(members_items)
+                
+                # Cálculo da Zona de Carga
+                zone = get_cargo_zone(i)
+                
                 with st.expander(f"Parada {i} — {len(stop['members'])} endereço(s) {tag}", expanded=False):
                     st.markdown(f"""<div class="info-card">
+                        <div style='margin-bottom:8px; font-weight:700; color:#ff9f1c; border-bottom:1px solid #333; padding-bottom:4px;'>
+                            📦 Zona: {zone} <span style='font-weight:400; color:#aaa; font-size:0.8em'>({items_per_stop} itens est.)</span>
+                        </div>
                         <div style='font-size:0.75rem;color:#5a7090;font-family:Space Mono,monospace;'>
                             Lat: {stop['centroid']['lat']:.5f} | Lng: {stop['centroid']['lng']:.5f}
                         </div>
@@ -1527,6 +1657,8 @@ with tab_export:
             # 2. Constrói o HTML da lista de paradas
             rows_html = ""
             for i, stop in enumerate(stops, start=1):
+                current_zone = get_cargo_zone(i)
+                
                 addr_items = []
                 for m in stop['members']:
                     # Links baseados no TEXTO do endereço
@@ -1544,10 +1676,49 @@ with tab_export:
                     <div class="stop-num" style="background: {tag_color};">{i}</div>
                     <div class="stop-content">
                         <div class="stop-title">{'📦 Agrupamento' if stop['is_cluster'] else '📍 Parada Individual'}</div>
+                        <div style="font-size:0.8rem; font-weight:bold; color:#e67e22; margin-bottom:4px;">📦 Zona: {current_zone}</div>
                         <ul class="addr-ul">{addr_list}</ul>
                     </div>
                 </div>
                 """
+
+            # Visualização Gráfica do Carro (HTML/CSS)
+            n_stops = len(stops)
+            z1_on = "active" if n_stops >= 1 else ""
+            z2_on = "active" if n_stops >= 9 else ""
+            z3_on = "active" if n_stops >= 21 else ""
+            z4_on = "active" if n_stops >= 35 else ""
+            
+            car_html = f"""
+            <div class="car-box">
+                <h3>🚗 Esquema de Carregamento</h3>
+                <div class="car-layout">
+                    <div class="car-row">
+                        <div class="car-seat driver">Motorista</div>
+                        <div class="car-seat {z1_on}">
+                            <div class="z-name">Banco Carona</div>
+                            <div class="z-range">Paradas 1-8</div>
+                        </div>
+                    </div>
+                    <div class="car-row">
+                        <div class="car-seat full {z2_on}">
+                            <div class="z-name">Banco Traseiro</div>
+                            <div class="z-range">Paradas 9-20</div>
+                        </div>
+                    </div>
+                    <div class="car-row trunk-area">
+                        <div class="car-seat half {z3_on}">
+                            <div class="z-name">Porta-malas (Meio)</div>
+                            <div class="z-range">21-34</div>
+                        </div>
+                        <div class="car-seat half {z4_on}">
+                            <div class="z-name">Porta-malas (Fundo)</div>
+                            <div class="z-range">35+</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """
 
             # 3. Cria o overlay com CSS para impressão e injeta no HTML do Folium
             # Sobrescrevemos o estilo do mapa para não ocupar 100% da tela no relatório
@@ -1557,6 +1728,7 @@ with tab_export:
                     <h1>Relatório de Rota — RotaMax</h1>
                     <p><strong>Partida:</strong> {origin.get('label', 'GPS')} • <strong>Paradas:</strong> {len(stops)} • <strong>Distância Est.:</strong> {total_distance_km(origin, stops):.1f} km</p>
                 </div>
+                {car_html}
                 <div class="rep-list">
                     {rows_html}
                 </div>
@@ -1580,6 +1752,19 @@ with tab_export:
                 .stop-title {{ font-weight: 700; font-size: 0.9rem; text-transform: uppercase; color: #555; margin-bottom: 4px; }}
                 .addr-ul {{ margin: 0; padding-left: 20px; font-size: 0.95rem; color: #333; }}
                 .addr-ul li {{ margin-bottom: 2px; }}
+                
+                /* Car Visualization */
+                .car-box {{ margin-bottom: 20px; padding: 15px; background: #f9f9f9; border: 1px solid #eee; border-radius: 8px; page-break-inside: avoid; }}
+                .car-box h3 {{ margin: 0 0 10px 0; font-size: 1rem; color: #444; }}
+                .car-layout {{ display: flex; flex-direction: column; gap: 5px; max-width: 320px; margin: 0 auto; border: 2px solid #555; border-radius: 12px 12px 4px 4px; padding: 10px; background: white; }}
+                .car-row {{ display: flex; gap: 5px; }}
+                .car-seat {{ flex: 1; border: 1px solid #ccc; background: #f0f0f0; padding: 8px; text-align: center; border-radius: 4px; color: #999; font-size: 0.8rem; }}
+                .car-seat.driver {{ background: #ddd; color: #333; font-weight: bold; }}
+                .car-seat.active {{ background: #d1fae5; border: 1px solid #10b981; color: #047857; font-weight: bold; }}
+                .car-seat.full {{ width: 100%; }}
+                .z-name {{ font-weight: bold; font-size: 0.85rem; margin-bottom: 2px; }}
+                .z-range {{ font-size: 0.7rem; opacity: 0.8; }}
+                .trunk-area {{ border-top: 2px dashed #ccc; padding-top: 5px; margin-top: 5px; }}
             </style>
             """
             

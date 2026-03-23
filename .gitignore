@@ -12,3 +12,5 @@ wheels/
 cache_addresses.json
 cache_geocoding.json
 backup_app.py
+app.py
+.streamlit/secrets.toml

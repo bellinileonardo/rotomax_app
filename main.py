@@ -784,7 +784,7 @@ def autosave_session():
         "origin_coords": st.session_state.origin_coords,
         "origin_label": st.session_state.origin_label,
         "geocoded_points": st.session_state.geocoded_points,
-        "route_ready": st.session_state.route_ready
+        "route_ready": st.session_state.route_ready,
         "timestamp": timestamp
     }    
     try:

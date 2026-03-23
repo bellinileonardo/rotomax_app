@@ -14,3 +14,4 @@ cache_geocoding.json
 backup_app.py
 app.py
 .streamlit/secrets.toml
+rotamax_autosave.json

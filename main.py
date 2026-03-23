@@ -771,6 +771,43 @@ def get_cached_addresses(file_bytes: bytes) -> Optional[list[str]]:
     return cache.get(h)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AUTOSAVE SYSTEM (SESSION PERSISTENCE)
+# ─────────────────────────────────────────────────────────────────────────────
+AUTOSAVE_FILE = "rotamax_autosave.json"
+
+def autosave_session():
+    """Salva o estado crítico da sessão em disco para recuperação."""
+    timestamp = time.time()
+    state_dump = {
+        "addresses": st.session_state.addresses,
+        "stops": st.session_state.stops,
+        "origin_coords": st.session_state.origin_coords,
+        "origin_label": st.session_state.origin_label,
+        "geocoded_points": st.session_state.geocoded_points,
+        "route_ready": st.session_state.route_ready
+        "timestamp": timestamp
+    }    
+    try:
+        with open(AUTOSAVE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state_dump, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Erro no autosave: {e}")
+
+def load_autosave():
+    """Carrega o estado salvo."""
+    if os.path.exists(AUTOSAVE_FILE):
+        try:
+            with open(AUTOSAVE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Verificação de timestamp
+                if "timestamp" in data and (time.time() - data["timestamp"]) < 3600:  # Validade de 1 hora (3600 segundos)
+                    for k, v in data.items():
+                        st.session_state[k] = v
+        except Exception as e:
+            print(f"Erro ao carregar autosave: {e}")
+            os.remove(AUTOSAVE_FILE)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FOLIUM MAP
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -798,7 +835,7 @@ def get_osrm_route(coordinates: list) -> Optional[dict]:
 
 def build_map(origin: dict, stops: list) -> folium.Map:
     center = [origin["lat"], origin["lng"]]
-    m = folium.Map(location=center, zoom_start=13, tiles="CartoDB dark_matter")
+    m = folium.Map(location=center, zoom_start=13, tiles="cartodbpositron")
 
     # Origin
     folium.Marker(
@@ -880,10 +917,7 @@ def build_map(origin: dict, stops: list) -> folium.Map:
             location=[stop["centroid"]["lat"], stop["centroid"]["lng"]],
             popup=folium.Popup(popup_html, max_width=280),
             tooltip=f"Parada {i} — {len(stop['members'])} endereço(s)",
-            icon=folium.DivIcon(
-                html=div_html,
-                icon_size=(28, 28), icon_anchor=(14, 14),
-            ),
+            icon=folium.DivIcon(html=div_html,icon_size=(28, 28), icon_anchor=(14, 14),),
             z_index_offset=1000
         ).add_to(m)
 
@@ -940,7 +974,7 @@ with st.sidebar:
                 text-transform:uppercase;margin-bottom:16px;'>Configurações</div>
     """, unsafe_allow_html=True)
     
-    provider = st.radio("Provedor IA", ["Claude", "Gemini", "Ollama"], horizontal=True)
+    provider = st.radio("Provedor IA", ["Claude", "Gemini", "Ollama"], horizontal=True, index=1)
     
     # Carrega defaults do .env
     env_claude = os.getenv("ANTHROPIC_API_KEY", "")
@@ -985,6 +1019,15 @@ with st.sidebar:
         else:
             st.warning("Preencha lat/lng válidos.")
 
+    # Botão de Restaurar Sessão (se existir autosave)
+    if os.path.exists(AUTOSAVE_FILE):
+        st.markdown("---")
+        if st.button("♻️ Restaurar Última Sessão", help="Recarrega endereços e rotas salvos automaticamente."):
+            load_autosave()
+            st.success("Sessão restaurada!")
+            time.sleep(1)
+            st.rerun()
+
     if st.button("🔍 Geocodificar Endereço", use_container_width=True):
         if origin_text.strip():
             with st.spinner("Geocodificando..."):
@@ -1023,7 +1066,7 @@ with st.sidebar:
     # ── CLUSTERING THRESHOLD ─────────────────────────────────────────────────
     st.markdown('<div class="card-title">Parâmetros</div>', unsafe_allow_html=True)
     
-    clustering_algo = st.selectbox("Algoritmo de Agrupamento", ["Simples (Greedy)", "DBSCAN", "K-Means"])
+    clustering_algo = st.selectbox("Algoritmo de Agrupamento", ["Simples (Greedy)", "DBSCAN", "K-Means"], key="clustering_algo", index=2)
     
     cluster_thresh = 50
     min_samples = 2
@@ -1225,8 +1268,7 @@ with tab_upload:
         st.markdown(f"---\n### Lista de Endereços ({len(st.session_state.addresses)})")
         df_preview = pd.DataFrame({"#": range(1, len(st.session_state.addresses)+1),
                                    "Endereço": st.session_state.addresses})
-        st.data_editor(df_preview, use_container_width=True, hide_index=True, on_change=st.rerun)
-        st.write(st.session_state)
+        st.data_editor(df_preview, use_container_width=True, hide_index=True, on_change=st.rerun)        
     else:
         st.markdown('<div class="status-info">ℹ Nenhum endereço ainda. Faça upload ou adicione manualmente na barra lateral.</div>',
                     unsafe_allow_html=True)
@@ -1353,6 +1395,7 @@ with tab_route:
             st.session_state.stops = ordered_stops
             st.session_state.geocoded_points = points
             st.session_state.route_ready = True
+            autosave_session() # Salva após calcular
             st.success(f"✓ Rota otimizada! {len(ordered_stops)} parada(s) para {len(points)} ponto(s).")
     
     # ── MANUAL EDIT FOR APPROXIMATE ADDRESSES ──────────────────────────────
@@ -1457,12 +1500,38 @@ with tab_route:
                             clusters = cluster_points(valid_points_refresh, threshold_m=cluster_thresh)
                             
                         st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, clusters)
+                        autosave_session() # Salva após edição manual
                         st.rerun()
 
     # ── RESULTS ─────────────────────────────────────────────────────────────
     if st.session_state.route_ready and st.session_state.stops:
         stops = st.session_state.stops
         origin = st.session_state.origin_coords
+
+        # ── MANUAL REORDERING ───────────────────────────────────────────────
+        with st.expander("📝 Reordenar Paradas Manualmente", expanded=False):
+            st.caption("Edite a coluna 'Ordem' para alterar a sequência e clique em Aplicar.")
+            
+            # Prepara DataFrame para edição
+            reorder_data = []
+            for idx, s in enumerate(stops):
+                reorder_data.append({
+                    "Ordem": idx + 1,
+                    "Endereço Principal": s["members"][0]["address"],
+                    "Qtd": len(s["members"]),
+                    "_original_idx": idx # Hidden index reference
+                })
+            
+            df_reorder = pd.DataFrame(reorder_data)
+            edited_df = st.data_editor(df_reorder, hide_index=True, column_config={"_original_idx": None}, disabled=["Endereço Principal", "Qtd"], use_container_width=True)
+            
+            if st.button("🔄 Aplicar Nova Ordem"):
+                # Ordena pelo input do usuário e reconstrói a lista de stops
+                edited_df.sort_values("Ordem", inplace=True)
+                new_order_indices = edited_df["_original_idx"].tolist()
+                st.session_state.stops = [st.session_state.stops[i] for i in new_order_indices]
+                autosave_session() # Salva após reordenar
+                st.rerun()
 
         # Metrics
         total_km = total_distance_km(origin, stops)
@@ -1538,6 +1607,7 @@ with tab_route:
                                     new_clusters = cluster_points(st.session_state.geocoded_points, threshold_m=cluster_thresh)
 
                                 st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, new_clusters)
+                                autosave_session() # Salva após correção visual
                                 st.rerun()
 
         with list_col:
@@ -1586,192 +1656,215 @@ with tab_export:
         stops = st.session_state.stops
         origin = st.session_state.origin_coords
 
-        # Google Maps link
-        st.markdown("#### 🗺 Google Maps")
-        gmaps_url = build_gmaps_url(origin, stops)
-        st.markdown(f'<div class="status-info">ℹ Google Maps suporta até 10 waypoints. Paradas extras serão ignoradas.</div>',
-                    unsafe_allow_html=True)
-        st.link_button("🗺 Abrir no Google Maps", gmaps_url, use_container_width=True, type="primary")
-        st.code(gmaps_url, language=None)
-
-        st.markdown("---")
-
-        # Waze link
-        st.markdown("#### 🚘 Waze")
-        if stops:
-            first_stop = stops[0]["centroid"]
-            waze_url = build_waze_url(first_stop["lat"], first_stop["lng"])
-            st.markdown(f'<div class="status-info">ℹ O Waze não suporta múltiplos pontos em um único link. O botão abaixo inicia a rota para a <b>1ª parada</b>. Os links das demais paradas estão na tabela/CSV abaixo.</div>', unsafe_allow_html=True)
-            st.link_button("🚘 Iniciar Rota no Waze (1ª Parada)", waze_url, use_container_width=True)
+        # ── CHART: LOAD DISTRIBUTION ──────────────────────────────────────
+        st.markdown("#### 📊 Distribuição de Carga")
         
-        st.markdown("---")
-
-        # CSV export
-        st.markdown("#### 📄 Exportar CSV")
-        rows = []
+        # Prepara dados para o gráfico
+        zone_stats = []
         for i, stop in enumerate(stops, start=1):
-            for m in stop["members"]:
-                rows.append({
-                    "Parada": i,
-                    "Tipo": "Agrupada" if stop["is_cluster"] else "Individual",
-                    "Endereço": m["address"],
-                    "Lat Parada": stop["centroid"]["lat"],
-                    "Lng Parada": stop["centroid"]["lng"],
-                    "Link Waze": build_waze_url(stop["centroid"]["lat"], stop["centroid"]["lng"])
-                })
-        df_export = pd.DataFrame(rows)
-        csv_bytes = df_export.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇ Baixar CSV da Rota", data=csv_bytes,
-                           file_name="rotamax_rota.csv", mime="text/csv",
-                           use_container_width=True)
-
-        st.markdown("---")
-
-        # JSON export (for pins)
-        st.markdown("#### 📍 Exportar JSON (Pins)")
-        pins = []
-        for i, stop in enumerate(stops, start=1):
-            pins.append({
-                "pin": i,
-                "lat": stop["centroid"]["lat"],
-                "lng": stop["centroid"]["lng"],
-                "type": "cluster" if stop["is_cluster"] else "single",
-                "addresses": [m["address"] for m in stop["members"]],
-            })
-        json_bytes = json.dumps({"origin": origin, "stops": pins}, ensure_ascii=False, indent=2).encode("utf-8")
-        st.download_button("⬇ Baixar JSON dos Pins", data=json_bytes,
-                           file_name="rotamax_pins.json", mime="application/json",
-                           use_container_width=True)
+            z = get_cargo_zone(i)
+            # Conta itens (membros) nesta parada
+            zone_stats.append({"Zona": z, "Volumes": len(stop["members"])})
         
-        st.markdown("---")
+        if zone_stats:
+            df_zones = pd.DataFrame(zone_stats)
+            # Agrupa e soma volumes por zona
+            df_chart = df_zones.groupby("Zona")["Volumes"].sum().reset_index()
+            
+            # Ordem lógica das zonas para o eixo X
+            zone_order = ["Banco Carona", "Banco Traseiro", "Porta-malas (Meio)", "Porta-malas (Fundo)"]
+            
+            st.bar_chart(df_chart, x="Zona", y="Volumes", color="Zona", use_container_width=True)
 
-        # HTML/PDF Report
-        st.markdown("#### 📄 Relatório com Mapa (PDF)")
-        st.caption("Gera um relatório visual completo. Após baixar, abra o arquivo e use **Ctrl+P (Salvar como PDF)** no seu navegador.")
+        # Cria abas internas para organizar a exportação
+        exp_tabs = st.tabs(["🗺 Google Maps", "🚘 Waze", "💾 CSV/JSON", "📄 Relatório PDF"])
 
-        if st.button("📝 Gerar Relatório de Impressão"):
-            # 1. Gera o mapa especificamente para o relatório
-            m_report = build_map(origin, stops)
-            full_html = m_report.get_root().render()
+        # ── TAB: GOOGLE MAPS ──────────────────────────────────────────────
+        with exp_tabs[0]:
+            st.markdown("#### Rota Sequencial")
+            gmaps_url = build_gmaps_url(origin, stops)
+            st.info("Google Maps suporta até 10 waypoints no link direto. Paradas excedentes serão ignoradas na prévia, mas estão completas nos arquivos.")
+            st.link_button("🗺 Abrir no Google Maps", gmaps_url, use_container_width=True, type="primary")
+            st.text_area("Link direto", gmaps_url, height=70)
 
-            # 2. Constrói o HTML da lista de paradas
-            rows_html = ""
+        # ── TAB: WAZE ─────────────────────────────────────────────────────
+        with exp_tabs[1]:
+            st.markdown("#### Navegação Ponto a Ponto")
+            if stops:
+                first_stop = stops[0]["centroid"]
+                waze_url = build_waze_url(first_stop["lat"], first_stop["lng"])
+                st.warning("O Waze não suporta rotas com múltiplos pontos via link. Use o botão abaixo para a **1ª parada** e os links individuais na tabela CSV/PDF para as próximas.")
+                st.link_button("🚘 Navegar para 1ª Parada", waze_url, use_container_width=True)
+            else:
+                st.info("Gere uma rota para ver o link.")
+
+        # ── TAB: CSV / JSON ───────────────────────────────────────────────
+        with exp_tabs[2]:
+            st.markdown("#### Arquivos de Dados")
+            
+            # Preparar dados CSV
+            rows = []
             for i, stop in enumerate(stops, start=1):
-                current_zone = get_cargo_zone(i)
-                
-                addr_items = []
-                for m in stop['members']:
-                    # Links baseados no TEXTO do endereço
-                    safe_addr = quote(m['address'])
-                    waze_link = f"https://waze.com/ul?q={safe_addr}&navigate=yes"
-                    gmaps_link = f"https://www.google.com/maps/search/?api=1&query={safe_addr}"
+                for m in stop["members"]:
+                    rows.append({
+                        "Parada": i,
+                        "Tipo": "Agrupada" if stop["is_cluster"] else "Individual",
+                        "Endereço": m["address"],
+                        "Lat": stop["centroid"]["lat"],
+                        "Lng": stop["centroid"]["lng"],
+                        "Link Waze": build_waze_url(stop["centroid"]["lat"], stop["centroid"]["lng"])
+                    })
+            df_export = pd.DataFrame(rows)
+            csv_bytes = df_export.to_csv(index=False).encode("utf-8")
+
+            # Preparar JSON
+            pins = []
+            for i, stop in enumerate(stops, start=1):
+                pins.append({
+                    "pin": i,
+                    "lat": stop["centroid"]["lat"],
+                    "lng": stop["centroid"]["lng"],
+                    "type": "cluster" if stop["is_cluster"] else "single",
+                    "addresses": [m["address"] for m in stop["members"]],
+                })
+            json_bytes = json.dumps({"origin": origin, "stops": pins}, ensure_ascii=False, indent=2).encode("utf-8")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("⬇ Baixar Planilha (.csv)", data=csv_bytes,
+                                file_name="rotamax_rota.csv", mime="text/csv", use_container_width=True)
+            with c2:
+                st.download_button("⬇ Baixar JSON (.json)", data=json_bytes,
+                                file_name="rotamax_pins.json", mime="application/json", use_container_width=True)
+            
+            st.markdown("##### Prévia dos Dados")
+            st.dataframe(df_export, use_container_width=True, hide_index=True, height=250, 
+                         column_config={"Link Waze": st.column_config.LinkColumn("Navegar")})
+
+        # ── TAB: REPORT PDF ───────────────────────────────────────────────
+        with exp_tabs[3]:
+            st.markdown("#### Relatório para Impressão")
+            st.caption("Gera um arquivo HTML otimizado para impressão (Salvar como PDF). Inclui mapa, lista de itens e QR Codes/Links.")
+
+            if st.button("📝 Gerar Relatório HTML"):
+                # 1. Gera o mapa especificamente para o relatório
+                m_report = build_map(origin, stops)
+                full_html = m_report.get_root().render()
+
+                # 2. Constrói o HTML da lista de paradas
+                rows_html = ""
+                for i, stop in enumerate(stops, start=1):
+                    current_zone = get_cargo_zone(i)
                     
-                    links_html = f"""<span style="margin-left:6px; font-size:0.75em;"><a href="{waze_link}" target="_blank" style="text-decoration:none; color:#333; border:1px solid #ccc; padding:0 3px; border-radius:3px;">Waze</a> <a href="{gmaps_link}" target="_blank" style="text-decoration:none; color:#333; border:1px solid #ccc; padding:0 3px; border-radius:3px;">Maps</a></span>"""
-                    addr_items.append(f"<li>{m['address']}{links_html}</li>")
+                    addr_items = []
+                    for m in stop['members']:
+                        # Links baseados no TEXTO do endereço para busca visual, mas Waze usa coords
+                        safe_addr = quote(m['address'])
+                        waze_link = f"https://waze.com/ul?ll={m['coords']['lat']}%2C{m['coords']['lng']}&navigate=yes"
+                        gmaps_link = f"https://www.google.com/maps/search/?api=1&query={safe_addr}"
+                        
+                        links_html = f"""<span style="margin-left:6px; font-size:0.75em;"><a href="{waze_link}" target="_blank" style="text-decoration:none; color:#333; border:1px solid #ccc; padding:0 3px; border-radius:3px;">Waze</a> <a href="{gmaps_link}" target="_blank" style="text-decoration:none; color:#333; border:1px solid #ccc; padding:0 3px; border-radius:3px;">Maps</a></span>"""
+                        addr_items.append(f"<li>{m['address']}{links_html}</li>")
+                    
+                    addr_list = "".join(addr_items)
+                    tag_color = "#00b8ff" if stop["is_cluster"] else "#00e5a0"
+                    rows_html += f"""
+                    <div class="stop-card">
+                        <div class="stop-num" style="background: {tag_color};">{i}</div>
+                        <div class="stop-content">
+                            <div class="stop-title">{'📦 Agrupamento' if stop['is_cluster'] else '📍 Parada Individual'}</div>
+                            <div style="font-size:0.8rem; font-weight:bold; color:#e67e22; margin-bottom:4px;">📦 Zona: {current_zone}</div>
+                            <ul class="addr-ul">{addr_list}</ul>
+                        </div>
+                    </div>
+                    """
+
+                # Visualização Gráfica do Carro (HTML/CSS)
+                n_stops = len(stops)
+                z1_on = "active" if n_stops >= 1 else ""
+                z2_on = "active" if n_stops >= 9 else ""
+                z3_on = "active" if n_stops >= 21 else ""
+                z4_on = "active" if n_stops >= 35 else ""
                 
-                addr_list = "".join(addr_items)
-                tag_color = "#00b8ff" if stop["is_cluster"] else "#00e5a0"
-                rows_html += f"""
-                <div class="stop-card">
-                    <div class="stop-num" style="background: {tag_color};">{i}</div>
-                    <div class="stop-content">
-                        <div class="stop-title">{'📦 Agrupamento' if stop['is_cluster'] else '📍 Parada Individual'}</div>
-                        <div style="font-size:0.8rem; font-weight:bold; color:#e67e22; margin-bottom:4px;">📦 Zona: {current_zone}</div>
-                        <ul class="addr-ul">{addr_list}</ul>
+                car_html = f"""
+                <div class="car-box">
+                    <h3>🚗 Esquema de Carregamento</h3>
+                    <div class="car-layout">
+                        <div class="car-row">
+                            <div class="car-seat driver">Motorista</div>
+                            <div class="car-seat {z1_on}">
+                                <div class="z-name">Banco Carona</div>
+                                <div class="z-range">Paradas 1-8</div>
+                            </div>
+                        </div>
+                        <div class="car-row">
+                            <div class="car-seat full {z2_on}">
+                                <div class="z-name">Banco Traseiro</div>
+                                <div class="z-range">Paradas 9-20</div>
+                            </div>
+                        </div>
+                        <div class="car-row trunk-area">
+                            <div class="car-seat half {z3_on}">
+                                <div class="z-name">Porta-malas (Meio)</div>
+                                <div class="z-range">21-34</div>
+                            </div>
+                            <div class="car-seat half {z4_on}">
+                                <div class="z-name">Porta-malas (Fundo)</div>
+                                <div class="z-range">35+</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 """
 
-            # Visualização Gráfica do Carro (HTML/CSS)
-            n_stops = len(stops)
-            z1_on = "active" if n_stops >= 1 else ""
-            z2_on = "active" if n_stops >= 9 else ""
-            z3_on = "active" if n_stops >= 21 else ""
-            z4_on = "active" if n_stops >= 35 else ""
-            
-            car_html = f"""
-            <div class="car-box">
-                <h3>🚗 Esquema de Carregamento</h3>
-                <div class="car-layout">
-                    <div class="car-row">
-                        <div class="car-seat driver">Motorista</div>
-                        <div class="car-seat {z1_on}">
-                            <div class="z-name">Banco Carona</div>
-                            <div class="z-range">Paradas 1-8</div>
-                        </div>
+                # 3. Cria o overlay com CSS para impressão e injeta no HTML do Folium
+                # Sobrescrevemos o estilo do mapa para não ocupar 100% da tela no relatório
+                custom_content = f"""
+                <div id="report-container">
+                    <div class="rep-header">
+                        <h1>Relatório de Rota — RotaMax</h1>
+                        <p><strong>Partida:</strong> {origin.get('label', 'GPS')} • <strong>Paradas:</strong> {len(stops)} • <strong>Distância Est.:</strong> {total_distance_km(origin, stops):.1f} km</p>
                     </div>
-                    <div class="car-row">
-                        <div class="car-seat full {z2_on}">
-                            <div class="z-name">Banco Traseiro</div>
-                            <div class="z-range">Paradas 9-20</div>
-                        </div>
-                    </div>
-                    <div class="car-row trunk-area">
-                        <div class="car-seat half {z3_on}">
-                            <div class="z-name">Porta-malas (Meio)</div>
-                            <div class="z-range">21-34</div>
-                        </div>
-                        <div class="car-seat half {z4_on}">
-                            <div class="z-name">Porta-malas (Fundo)</div>
-                            <div class="z-range">35+</div>
-                        </div>
+                    {car_html}
+                    <div class="rep-list">
+                        {rows_html}
                     </div>
                 </div>
-            </div>
-            """
-
-            # 3. Cria o overlay com CSS para impressão e injeta no HTML do Folium
-            # Sobrescrevemos o estilo do mapa para não ocupar 100% da tela no relatório
-            custom_content = f"""
-            <div id="report-container">
-                <div class="rep-header">
-                    <h1>Relatório de Rota — RotaMax</h1>
-                    <p><strong>Partida:</strong> {origin.get('label', 'GPS')} • <strong>Paradas:</strong> {len(stops)} • <strong>Distância Est.:</strong> {total_distance_km(origin, stops):.1f} km</p>
-                </div>
-                {car_html}
-                <div class="rep-list">
-                    {rows_html}
-                </div>
-            </div>
-            <style>
-                /* Ajustes para o Mapa aparecer no topo e não tela cheia */
-                html, body {{ height: auto !important; overflow: visible !important; }}
-                .folium-map {{ 
-                    position: relative !important; 
-                    height: 450px !important; 
-                    width: 100% !important;
-                    border-bottom: 5px solid #111827;
-                }}
+                <style>
+                    /* Ajustes para o Mapa aparecer no topo e não tela cheia */
+                    html, body {{ height: auto !important; overflow: visible !important; }}
+                    .folium-map {{ 
+                        position: relative !important; 
+                        height: 450px !important; 
+                        width: 100% !important;
+                        border-bottom: 5px solid #111827;
+                    }}
+                    
+                    /* Estilos do Relatório */
+                    #report-container {{ padding: 20px; font-family: 'Segoe UI', sans-serif; background: white; color: #111; }}
+                    .rep-header {{ margin-bottom: 20px; border-bottom: 2px solid #ddd; padding-bottom: 15px; }}
+                    .rep-header h1 {{ margin: 0 0 5px 0; color: #111827; }}
+                    .stop-card {{ display: flex; border-bottom: 1px solid #eee; padding: 12px 0; page-break-inside: avoid; }}
+                    .stop-num {{ font-size: 1.2rem; font-weight: bold; color: #fff; width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-right: 15px; flex-shrink: 0; print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+                    .stop-title {{ font-weight: 700; font-size: 0.9rem; text-transform: uppercase; color: #555; margin-bottom: 4px; }}
+                    .addr-ul {{ margin: 0; padding-left: 20px; font-size: 0.95rem; color: #333; }}
+                    .addr-ul li {{ margin-bottom: 2px; }}
+                    
+                    /* Car Visualization */
+                    .car-box {{ margin-bottom: 20px; padding: 15px; background: #f9f9f9; border: 1px solid #eee; border-radius: 8px; page-break-inside: avoid; }}
+                    .car-box h3 {{ margin: 0 0 10px 0; font-size: 1rem; color: #444; }}
+                    .car-layout {{ display: flex; flex-direction: column; gap: 5px; max-width: 320px; margin: 0 auto; border: 2px solid #555; border-radius: 12px 12px 4px 4px; padding: 10px; background: white; }}
+                    .car-row {{ display: flex; gap: 5px; }}
+                    .car-seat {{ flex: 1; border: 1px solid #ccc; background: #f0f0f0; padding: 8px; text-align: center; border-radius: 4px; color: #999; font-size: 0.8rem; }}
+                    .car-seat.driver {{ background: #ddd; color: #333; font-weight: bold; }}
+                    .car-seat.active {{ background: #d1fae5; border: 1px solid #10b981; color: #047857; font-weight: bold; }}
+                    .car-seat.full {{ width: 100%; }}
+                    .z-name {{ font-weight: bold; font-size: 0.85rem; margin-bottom: 2px; }}
+                    .z-range {{ font-size: 0.7rem; opacity: 0.8; }}
+                    .trunk-area {{ border-top: 2px dashed #ccc; padding-top: 5px; margin-top: 5px; }}
+                </style>
+                """
                 
-                /* Estilos do Relatório */
-                #report-container {{ padding: 20px; font-family: 'Segoe UI', sans-serif; background: white; color: #111; }}
-                .rep-header {{ margin-bottom: 20px; border-bottom: 2px solid #ddd; padding-bottom: 15px; }}
-                .rep-header h1 {{ margin: 0 0 5px 0; color: #111827; }}
-                .stop-card {{ display: flex; border-bottom: 1px solid #eee; padding: 12px 0; page-break-inside: avoid; }}
-                .stop-num {{ font-size: 1.2rem; font-weight: bold; color: #fff; width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-right: 15px; flex-shrink: 0; print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
-                .stop-title {{ font-weight: 700; font-size: 0.9rem; text-transform: uppercase; color: #555; margin-bottom: 4px; }}
-                .addr-ul {{ margin: 0; padding-left: 20px; font-size: 0.95rem; color: #333; }}
-                .addr-ul li {{ margin-bottom: 2px; }}
+                final_html = full_html.replace("</body>", f"{custom_content}</body>")
                 
-                /* Car Visualization */
-                .car-box {{ margin-bottom: 20px; padding: 15px; background: #f9f9f9; border: 1px solid #eee; border-radius: 8px; page-break-inside: avoid; }}
-                .car-box h3 {{ margin: 0 0 10px 0; font-size: 1rem; color: #444; }}
-                .car-layout {{ display: flex; flex-direction: column; gap: 5px; max-width: 320px; margin: 0 auto; border: 2px solid #555; border-radius: 12px 12px 4px 4px; padding: 10px; background: white; }}
-                .car-row {{ display: flex; gap: 5px; }}
-                .car-seat {{ flex: 1; border: 1px solid #ccc; background: #f0f0f0; padding: 8px; text-align: center; border-radius: 4px; color: #999; font-size: 0.8rem; }}
-                .car-seat.driver {{ background: #ddd; color: #333; font-weight: bold; }}
-                .car-seat.active {{ background: #d1fae5; border: 1px solid #10b981; color: #047857; font-weight: bold; }}
-                .car-seat.full {{ width: 100%; }}
-                .z-name {{ font-weight: bold; font-size: 0.85rem; margin-bottom: 2px; }}
-                .z-range {{ font-size: 0.7rem; opacity: 0.8; }}
-                .trunk-area {{ border-top: 2px dashed #ccc; padding-top: 5px; margin-top: 5px; }}
-            </style>
-            """
-            
-            final_html = full_html.replace("</body>", f"{custom_content}</body>")
-            
-            st.download_button("⬇ Baixar Arquivo HTML (Para PDF)", data=final_html, file_name="Relatorio_RotaMax.html", mime="text/html", use_container_width=True)
-
-        # Preview table
-        st.markdown("---\n#### Resumo da Rota")
-        st.dataframe(df_export, use_container_width=True, hide_index=True, column_config={"Link Waze": st.column_config.LinkColumn("Link Waze")})
+                st.download_button("⬇ Baixar HTML (Para PDF)", data=final_html, file_name="Relatorio_RotaMax.html", mime="text/html", use_container_width=True)

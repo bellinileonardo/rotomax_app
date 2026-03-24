@@ -15,3 +15,5 @@ backup_app.py
 app.py
 .streamlit/secrets.toml
 rotamax_autosave.json
+rotas.db
+assets/mascote/unnamed.jpg

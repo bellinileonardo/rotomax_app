@@ -271,6 +271,50 @@ def load_route_db(route_id: int) -> Optional[dict]:
 init_db()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SETTINGS & AI TEST UTILS
+# ─────────────────────────────────────────────────────────────────────────────
+SETTINGS_FILE = "ai_settings.json"
+
+def load_ai_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_ai_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except:
+        return False
+
+def test_ai_connection(provider, key, model, host=""):
+    try:
+        if provider == "Claude":
+            if not key: return False, "Chave vazia"
+            r = requests.post("https://api.anthropic.com/v1/messages", 
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": model, "max_tokens": 5, "messages": [{"role": "user", "content": "Hi"}]}, timeout=8)
+            return (True, "OK") if r.status_code == 200 else (False, f"Erro {r.status_code}")
+        elif provider == "Gemini":
+            if not key: return False, "Chave vazia"
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": "Hi"}]}]}, timeout=8)
+            return (True, "OK") if r.status_code == 200 else (False, f"Erro {r.status_code}")
+        elif provider == "Ollama":
+            r = requests.post(f"{host.rstrip('/')}/api/generate", 
+                json={"model": model, "prompt": "Hi", "stream": False}, timeout=5)
+            return (True, "OK") if r.status_code == 200 else (False, f"Erro {r.status_code}")
+    except Exception as e:
+        return False, str(e)
+    return False, "Provedor inválido"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ALGORITHMS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -627,7 +671,7 @@ def process_json_response(text: str) -> list[str]:
     except json.JSONDecodeError:
         return []
 
-def extract_addresses_from_image_gemini(image_bytes: bytes, media_type: str, api_key: str) -> list[str]:
+def extract_addresses_from_image_gemini(image_bytes: bytes, media_type: str, api_key: str, model: str) -> list[str]:
     b64 = base64.b64encode(image_bytes).decode()
     payload = {
         "contents": [{
@@ -654,7 +698,7 @@ def extract_addresses_from_image_gemini(image_bytes: bytes, media_type: str, api
             ]
         }]
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     resp = requests.post(
         url,
         headers={"Content-Type": "application/json"},
@@ -684,10 +728,10 @@ def extract_addresses_from_image_gemini(image_bytes: bytes, media_type: str, api
 # CLAUDE AI — EXTRACT ADDRESSES FROM IMAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_addresses_from_image(image_bytes: bytes, media_type: str, api_key: str) -> list[str]:
+def extract_addresses_from_image(image_bytes: bytes, media_type: str, api_key: str, model: str) -> list[str]:
     b64 = base64.b64encode(image_bytes).decode()
     payload = {
-        "model": "claude-opus-4-5",
+        "model": model,
         "max_tokens": 1024,
         "messages": [{
             "role": "user",
@@ -1027,26 +1071,65 @@ with st.sidebar:
                 text-transform:uppercase;margin-bottom:16px;'>Configurações</div>
     """, unsafe_allow_html=True)
     with st.expander("Provedor de IA", expanded=False):       
-        provider = st.radio("Provedor IA", ["Claude", "Gemini", "Ollama"], horizontal=True, index=1)
+        # Carrega configurações salvas ou usa variáveis de ambiente/default
+        saved_settings = load_ai_settings()
         
-        # Carrega defaults do .env
-        env_claude = os.getenv("ANTHROPIC_API_KEY", "")
-        env_gemini = os.getenv("GEMINI_API_KEY", "")
-        env_ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-        env_ollama_model = os.getenv("OLLAMA_MODEL", "llava")
+        default_provider_idx = ["Claude", "Gemini", "Ollama"].index(saved_settings.get("provider", "Gemini")) if saved_settings.get("provider") in ["Claude", "Gemini", "Ollama"] else 1
+        provider = st.radio("Provedor IA", ["Claude", "Gemini", "Ollama"], horizontal=True, index=default_provider_idx)
+        
+        env_claude = saved_settings.get("claude_key", os.getenv("ANTHROPIC_API_KEY", ""))
+        env_gemini = saved_settings.get("gemini_key", os.getenv("GEMINI_API_KEY", ""))
+        env_ollama_host = saved_settings.get("ollama_host", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
+        env_ollama_model = saved_settings.get("ollama_model", os.getenv("OLLAMA_MODEL", "llava"))
+        
+        # Defaults de modelos para Claude/Gemini se não salvos
+        def_claude_model = saved_settings.get("claude_model", "claude-3-5-sonnet-20240620")
+        def_gemini_model = saved_settings.get("gemini_model", "gemini-2.0-flash")
+
         env_lat = float(os.getenv("DEFAULT_ORIGIN_LAT", -23.550520))
         env_lng = float(os.getenv("DEFAULT_ORIGIN_LNG", -46.633308))
         env_city_ctx = os.getenv("DEFAULT_CITY_CONTEXT", "")
 
         api_key = ""
+        selected_model = ""
         if provider == "Claude":
             api_key = st.text_input("🔑 Chave API Anthropic", value=env_claude, type="password", help="Necessária para Claude")
+            selected_model = st.text_input("Modelo Claude", value=def_claude_model)
         elif provider == "Gemini":
             api_key = st.text_input("🔑 Chave API Gemini", value=env_gemini, type="password", help="Necessária para Gemini")
+            selected_model = st.text_input("Modelo Gemini", value=def_gemini_model)
         else:
             # Configurações Ollama
             ollama_host = st.text_input("Host Ollama", value=env_ollama_host)
-            ollama_model = st.text_input("Modelo (Vision)", value=env_ollama_model)
+            selected_model = st.text_input("Modelo (Vision)", value=env_ollama_model)
+
+        # Botões de Teste e Salvar
+        c_test, c_save = st.columns(2)
+        with c_test:
+            if st.button("🧪 Testar Conexão", use_container_width=True):
+                ok, msg = test_ai_connection(provider, api_key, selected_model, ollama_host if provider == "Ollama" else "")
+                if ok:
+                    st.success(f"Sucesso: {msg}")
+                else:
+                    st.error(f"Falha: {msg}")
+        with c_save:
+            if st.button("💾 Salvar Config", use_container_width=True):
+                new_settings = saved_settings.copy()
+                new_settings["provider"] = provider
+                if provider == "Claude":
+                    new_settings["claude_key"] = api_key
+                    new_settings["claude_model"] = selected_model
+                elif provider == "Gemini":
+                    new_settings["gemini_key"] = api_key
+                    new_settings["gemini_model"] = selected_model
+                else:
+                    new_settings["ollama_host"] = ollama_host
+                    new_settings["ollama_model"] = selected_model
+                
+                if save_ai_settings(new_settings):
+                    st.toast("Configurações salvas em ai_settings.json!", icon="💾")
+                else:
+                    st.error("Erro ao salvar arquivo.")
 
     st.divider()    
 
@@ -1290,11 +1373,11 @@ with tab_upload:
                         
                         for img_bytes, img_mime, label in images_to_process:
                             if provider == "Gemini":
-                                addrs = extract_addresses_from_image_gemini(img_bytes, img_mime, api_key)
+                                addrs = extract_addresses_from_image_gemini(img_bytes, img_mime, api_key, selected_model)
                             elif provider == "Ollama":
-                                addrs = extract_addresses_from_image_ollama(img_bytes, img_mime, ollama_model, ollama_host)
+                                addrs = extract_addresses_from_image_ollama(img_bytes, img_mime, selected_model, ollama_host)
                             else:
-                                addrs = extract_addresses_from_image(img_bytes, img_mime, api_key)
+                                addrs = extract_addresses_from_image(img_bytes, img_mime, api_key, selected_model)
 
                             # Processa múltiplos números (ex: "Rua X, 10, 20")
                             addrs_processed = expand_multi_addresses(addrs)

@@ -1011,7 +1011,7 @@ with st.sidebar:
     with col_gps2:
         lng_in = st.number_input("Longitude", value=env_lng, format="%.6f", key="lng_in")
 
-    if st.button("📍 Usar Coordenadas GPS", use_container_width=True):
+    if st.button("📍 Usar Coordenadas GPS", width='stretch'):
         if lat_in != 0.0 and lng_in != 0.0:
             st.session_state.origin_coords = {"lat": lat_in, "lng": lng_in}
             st.session_state.origin_label = f"GPS ({lat_in:.5f}, {lng_in:.5f})"
@@ -1028,7 +1028,7 @@ with st.sidebar:
             time.sleep(1)
             st.rerun()
 
-    if st.button("🔍 Geocodificar Endereço", use_container_width=True):
+    if st.button("🔍 Geocodificar Endereço", width='stretch'):
         if origin_text.strip():
             with st.spinner("Geocodificando..."):
                 # Usa a mesma função melhorada
@@ -1053,7 +1053,7 @@ with st.sidebar:
     # ── MANUAL ADDRESS ───────────────────────────────────────────────────────
     st.markdown('<div class="card-title">Endereço Manual</div>', unsafe_allow_html=True)
     manual_addr = st.text_input("Endereço", placeholder="Rua X, 123, Cidade", key="manual_input")
-    if st.button("➕ Adicionar", use_container_width=True):
+    if st.button("➕ Adicionar", width='stretch'):
         v = manual_addr.strip()
         if v:
             v = normalize_address(v)
@@ -1097,7 +1097,7 @@ with st.sidebar:
                     st.session_state.addresses.pop(i)
                     st.rerun()
 
-        if st.button("♻ Remover Duplicatas", use_container_width=True):
+        if st.button("♻ Remover Duplicatas", width='stretch'):
             seen = set()
             unique_list = []
             for addr in st.session_state.addresses:
@@ -1109,7 +1109,7 @@ with st.sidebar:
             st.session_state.addresses = unique_list
             st.rerun()
 
-        if st.button("🗑 Limpar Todos", use_container_width=True, type="secondary"):
+        if st.button("🗑 Limpar Todos", width='stretch', type="secondary"):
             st.session_state.addresses.clear()
             st.session_state.stops.clear()
             st.session_state.route_ready = False
@@ -1123,7 +1123,7 @@ st.markdown("""
 <div class="rota-header">
   <div>
     <div class="rota-logo">Rota<span>Max</span></div>
-    <div class="rota-tag">Otimizador de Entregas · TSP + Agrupamento 100m · IA</div>
+    <div class="rota-tag">Otimizador de Entregas · TSP + IA</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1147,9 +1147,9 @@ with tab_upload:
     if uploaded:
         col_proc, col_clear = st.columns([1, 1])
         with col_proc:
-            do_extract = st.button("⚡ Extrair Endereços", type="primary", use_container_width=True)
+            do_extract = st.button("⚡ Extrair Endereços", type="primary", width='stretch')
         with col_clear:
-            if st.button("✕ Limpar Arquivos", use_container_width=True):
+            if st.button("✕ Limpar Arquivos", width='stretch'):
                 st.rerun()
 
         if do_extract:
@@ -1268,7 +1268,7 @@ with tab_upload:
         st.markdown(f"---\n### Lista de Endereços ({len(st.session_state.addresses)})")
         df_preview = pd.DataFrame({"#": range(1, len(st.session_state.addresses)+1),
                                    "Endereço": st.session_state.addresses})
-        st.data_editor(df_preview, use_container_width=True, hide_index=True, on_change=st.rerun)        
+        st.data_editor(df_preview, width='stretch', hide_index=True, on_change=st.rerun)        
     else:
         st.markdown('<div class="status-info">ℹ Nenhum endereço ainda. Faça upload ou adicione manualmente na barra lateral.</div>',
                     unsafe_allow_html=True)
@@ -1523,7 +1523,7 @@ with tab_route:
                 })
             
             df_reorder = pd.DataFrame(reorder_data)
-            edited_df = st.data_editor(df_reorder, hide_index=True, column_config={"_original_idx": None}, disabled=["Endereço Principal", "Qtd"], use_container_width=True)
+            edited_df = st.data_editor(df_reorder, hide_index=True, column_config={"_original_idx": None}, disabled=["Endereço Principal", "Qtd"], width='stretch')
             
             if st.button("🔄 Aplicar Nova Ordem"):
                 # Ordena pelo input do usuário e reconstrói a lista de stops
@@ -1674,7 +1674,7 @@ with tab_export:
             # Ordem lógica das zonas para o eixo X
             zone_order = ["Banco Carona", "Banco Traseiro", "Porta-malas (Meio)", "Porta-malas (Fundo)"]
             
-            st.bar_chart(df_chart, x="Zona", y="Volumes", color="Zona", use_container_width=True)
+            st.bar_chart(df_chart, x="Zona", y="Volumes", color="Zona", width='stretch')
 
         # Cria abas internas para organizar a exportação
         exp_tabs = st.tabs(["🗺 Google Maps", "🚘 Waze", "💾 CSV/JSON", "📄 Relatório PDF"])
@@ -1684,7 +1684,7 @@ with tab_export:
             st.markdown("#### Rota Sequencial")
             gmaps_url = build_gmaps_url(origin, stops)
             st.info("Google Maps suporta até 10 waypoints no link direto. Paradas excedentes serão ignoradas na prévia, mas estão completas nos arquivos.")
-            st.link_button("🗺 Abrir no Google Maps", gmaps_url, use_container_width=True, type="primary")
+            st.link_button("🗺 Abrir no Google Maps", gmaps_url, width='stretch', type="primary")
             st.text_area("Link direto", gmaps_url, height=70)
 
         # ── TAB: WAZE ─────────────────────────────────────────────────────
@@ -1694,7 +1694,7 @@ with tab_export:
                 first_stop = stops[0]["centroid"]
                 waze_url = build_waze_url(first_stop["lat"], first_stop["lng"])
                 st.warning("O Waze não suporta rotas com múltiplos pontos via link. Use o botão abaixo para a **1ª parada** e os links individuais na tabela CSV/PDF para as próximas.")
-                st.link_button("🚘 Navegar para 1ª Parada", waze_url, use_container_width=True)
+                st.link_button("🚘 Navegar para 1ª Parada", waze_url, width='stretch')
             else:
                 st.info("Gere uma rota para ver o link.")
 
@@ -1732,13 +1732,13 @@ with tab_export:
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button("⬇ Baixar Planilha (.csv)", data=csv_bytes,
-                                file_name="rotamax_rota.csv", mime="text/csv", use_container_width=True)
+                                file_name="rotamax_rota.csv", mime="text/csv", width='stretch')
             with c2:
                 st.download_button("⬇ Baixar JSON (.json)", data=json_bytes,
-                                file_name="rotamax_pins.json", mime="application/json", use_container_width=True)
+                                file_name="rotamax_pins.json", mime="application/json", width='stretch')
             
             st.markdown("##### Prévia dos Dados")
-            st.dataframe(df_export, use_container_width=True, hide_index=True, height=250, 
+            st.dataframe(df_export, width='stretch', hide_index=True, height=250, 
                          column_config={"Link Waze": st.column_config.LinkColumn("Navegar")})
 
         # ── TAB: REPORT PDF ───────────────────────────────────────────────
@@ -1867,4 +1867,4 @@ with tab_export:
                 
                 final_html = full_html.replace("</body>", f"{custom_content}</body>")
                 
-                st.download_button("⬇ Baixar HTML (Para PDF)", data=final_html, file_name="Relatorio_RotaMax.html", mime="text/html", use_container_width=True)
+                st.download_button("⬇ Baixar HTML (Para PDF)", data=final_html, file_name="Relatorio_RotaMax.html", mime="text/html", width='stretch')

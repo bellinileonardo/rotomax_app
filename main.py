@@ -1171,10 +1171,10 @@ with st.sidebar:
                 new_settings = saved_settings.copy()
                 new_settings["provider"] = provider
                 if provider == "Claude":
-                    new_settings["claude_key"] = api_key
+                    #new_settings["claude_key"] = api_key
                     new_settings["claude_model"] = selected_model
                 elif provider == "Gemini":
-                    new_settings["gemini_key"] = api_key
+                    #new_settings["gemini_key"] = api_key
                     new_settings["gemini_model"] = selected_model
                 else:
                     new_settings["ollama_host"] = ollama_host

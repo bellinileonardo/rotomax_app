@@ -25,7 +25,7 @@ from typing import Optional
 from pdf2image import convert_from_bytes
 from dotenv import load_dotenv
 from PIL import Image, ImageStat, ExifTags
-from folium.plugins import Draw
+from folium.plugins import Draw, Fullscreen, LocateControl
 from streamlit_js_eval import get_geolocation
 import sqlite3
 from datetime import datetime
@@ -555,6 +555,26 @@ def check_image_issues(file_bytes: bytes) -> list[str]:
         pass
     return issues
 
+def optimize_image(image_bytes: bytes, max_size: int = 1280, quality: int = 85) -> bytes:
+    """
+    Redimensiona e otimiza imagens para reduzir uso de memória (celular) e payload de API.
+    Converte para JPEG e limita dimensão máxima.
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        # Converte para RGB (remove canal Alpha de PNGs para salvar como JPEG)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            
+        out_buf = io.BytesIO()
+        img.save(out_buf, format="JPEG", quality=quality, optimize=True)
+        return out_buf.getvalue()
+    except Exception:
+        return image_bytes
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCODING (Nominatim – free)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -958,8 +978,11 @@ def build_map(origin: dict, stops: list) -> folium.Map:
 
     # Stop markers
     for i, stop in enumerate(stops, start=1):
-        # Cor baseada no tipo: Cluster (Azul), Exato (Verde), Contexto/Aprox (Laranja)
-        if stop["is_cluster"]:
+        # Cor baseada no status e tipo
+        if stop.get("completed", False):
+            bg_color = "#6c757d" # Cinza (Concluída)
+            border_color = "#343a40"
+        elif stop["is_cluster"]:
             bg_color = "#00b8ff" # Azul Cluster
             border_color = "#000"
         else:
@@ -1032,6 +1055,37 @@ def build_map(origin: dict, stops: list) -> folium.Map:
         },
         edit_options={"edit": False, "remove": True}
     ).add_to(m)
+
+    # ── FULLSCREEN & GPS REAL-TIME ──
+    Fullscreen(
+        position="topright",
+        title="Expandir para Tela Cheia",
+        title_cancel="Sair da Tela Cheia",
+        force_separate_button=True,
+    ).add_to(m)
+
+    LocateControl(
+        auto_start=False,
+        locateOptions={'enableHighAccuracy': True, 'maxZoom': 16},
+        strings={"title": "Mostrar minha localização atual", "popup": "Você está aqui"},
+        position="topright",
+    ).add_to(m)
+
+    # ── CAMADA DE TRÂNSITO ──
+    # AVISO: O uso direto das camadas do Google viola os Termos de Serviço e pode parar de funcionar.
+    # Para um ambiente de produção, é recomendado usar uma API como a do HERE Maps, que oferece um plano gratuito.
+    google_traffic_url = "https://mt1.google.com/vt/lyrs=h&x={x}&y={y}&z={z}"
+    folium.TileLayer(
+        tiles=google_traffic_url,
+        attr='Google Traffic',
+        name='Trânsito em Tempo Real (Google)',
+        overlay=True,
+        control=True,
+        show=False  # A camada começa desabilitada por padrão
+    ).add_to(m)
+
+    # Adiciona o controle que permite ligar/desligar as camadas (como a de trânsito)
+    folium.LayerControl().add_to(m)
 
     # Fit bounds
     all_lats = [origin["lat"]] + [s["centroid"]["lat"] for s in stops]
@@ -1159,18 +1213,29 @@ with st.sidebar:
 
     # ── GPS AUTOMÁTICO ──
     st.markdown('<div class="card-title">Obter minha Localização</div>', unsafe_allow_html=True)
+
+    # Inicializa o estado dos inputs de GPS se não existirem, para evitar conflito com o `value`
+    if 'lat_in' not in st.session_state:
+        st.session_state.lat_in = env_lat
+    if 'lng_in' not in st.session_state:
+        st.session_state.lng_in = env_lng
+
     if st.checkbox("📍 Obter GPS do Dispositivo", help="Ative para buscar sua localização atual"):
         geo_loc = get_geolocation(component_key='get_gps_loc')
+        geo_data = geo_loc["coords"] if geo_loc else None
+        geo_data_lat = geo_data["latitude"] if geo_data else None
+        geo_data_lng = geo_data["longitude"] if geo_data else None
         if geo_loc:
-            st.session_state['lat_in'] = geo_loc['coords']['latitude']
-            st.session_state['lng_in'] = geo_loc['coords']['longitude']
-            # O rerun acontece automaticamente quando o componente retorna o valor
-
+            st.session_state["lat_in"] = geo_data_lat
+            st.session_state["lng_in"] = geo_data_lng
+            
+        st.caption("Localização Capturada:")
+        #st.write(f"Lat: {st.session_state.lat_in:.5f} | Lng: {st.session_state.lng_in:.5f}")
     col_gps1, col_gps2 = st.columns([1, 1])
     with col_gps1:
-        lat_in = st.number_input("Latitude", value=env_lat, format="%.6f", key="lat_in")
+        lat_in = st.number_input("Latitude", value=st.session_state.lat_in, format="%.5f", key="lat_in")
     with col_gps2:
-        lng_in = st.number_input("Longitude", value=env_lng, format="%.6f", key="lng_in")
+        lng_in = st.number_input("Longitude", value=st.session_state.lng_in, format="%.5f", key="lng_in")
 
     if st.button(" Confirmar/Usar Coordenadas", width='stretch'):
         if lat_in != 0.0 and lng_in != 0.0:
@@ -1183,7 +1248,6 @@ with st.sidebar:
     st.markdown('<div class="card-title">Restaurar Última Sessão</div>', unsafe_allow_html=True)
     # Botão de Restaurar Sessão (se existir autosave)
     if os.path.exists(AUTOSAVE_FILE):
-        st.markdown("---")
         if st.button("♻️ Restaurar Sessão", help="Recarrega endereços e rotas salvos automaticamente."):
             load_autosave()
             st.success("Sessão restaurada!")
@@ -1217,16 +1281,10 @@ with st.sidebar:
         else:
             st.info("Nenhuma rota salva.")
 
-
-
-
-    
-    st.divider()
-
     # ── CLUSTERING THRESHOLD ─────────────────────────────────────────────────
-    st.markdown('<div class="card-title">Parâmetros</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">Parâmetros Clusterização</div>', unsafe_allow_html=True)
     
-    clustering_algo = st.selectbox("Algoritmo de Agrupamento", ["Simples (Greedy)", "DBSCAN", "K-Means"], key="clustering_algo", index=0)
+    clustering_algo = st.selectbox("Algoritmo de Agrupamento", ["Simples (Greedy)", "DBSCAN", "K-Means"], key="clustering_algo", index=0, help="Algoritimo para junção de endereços em paradas unicas(Cluster)")
     
     cluster_thresh = 60
     min_samples = 2
@@ -1346,6 +1404,10 @@ with tab_upload:
                     # Lógica para tratar Imagem ou PDF
                     images_to_process = [] # Lista de tuplas (bytes, mime_type, label)
                     
+                    # Otimiza a imagem "crua" se não for PDF nem CSV
+                    if not f.name.lower().endswith(".pdf"):
+                        raw = optimize_image(raw)
+                    
                     if f.name.lower().endswith(".pdf"):
                         try:
                             # Converte páginas do PDF em imagens
@@ -1353,7 +1415,9 @@ with tab_upload:
                             for p_idx, p_img in enumerate(pil_images):
                                 buf = io.BytesIO()
                                 p_img.save(buf, format="JPEG")
-                                images_to_process.append((buf.getvalue(), "image/jpeg", f"Pág {p_idx+1}"))
+                                # Otimiza também as páginas do PDF
+                                optimized_page = optimize_image(buf.getvalue())
+                                images_to_process.append((optimized_page, "image/jpeg", f"Pág {p_idx+1}"))
                         except Exception as e:
                             st.error(f"Erro ao converter PDF {f.name}: {e}")
                             continue
@@ -1755,7 +1819,11 @@ with tab_route:
             st.markdown("#### 🗺 Mapa da Rota")
             st.caption("Para corrigir um local, selecione o Marcador (📍) no mapa e clique na posição correta.")
             fmap = build_map(origin, stops)
-            map_out = st_folium(fmap, width=None, height=480)
+            
+            # 'returned_objects' limita o que volta do frontend. 
+            # Removendo zoom/bounds do retorno evita recarregamento da página ao interagir com o mapa.
+            map_out = st_folium(fmap, width=None, height=480, 
+                                returned_objects=["last_active_drawing"])
             
             # Handle Draw Events (Visual Correction)
             if map_out and map_out.get("last_active_drawing"):
@@ -1880,8 +1948,12 @@ with tab_route:
             items_per_stop = math.ceil(total_vols / len(stops))
 
             for i, stop in enumerate(stops, start=1):
+                is_done = stop.get("completed", False)
+                
                 badge_class = "cluster" if stop["is_cluster"] else ""
                 tag = "📦 Agrupada" if stop["is_cluster"] else "📍 Individual"
+                if is_done:
+                    tag += " (Concluída)"
                 members_items = []
                 for m in stop["members"]:
                     if m.get("type") in ["approx", "context"]:
@@ -1893,7 +1965,24 @@ with tab_route:
                 # Cálculo da Zona de Carga
                 zone = get_cargo_zone(i)
                 
-                with st.expander(f"Parada {i} — {len(stop['members'])} endereço(s) {tag}", expanded=False):
+                icon_status = "✅ " if is_done else ""
+                with st.expander(f"{icon_status}Parada {i} — {len(stop['members'])} endereço(s) {tag}", expanded=False):
+                    # Botão de Conclusão
+                    btn_label = "↩ Desmarcar Entrega" if is_done else "✅ Marcar como Concluída"
+                    btn_type = "secondary" if is_done else "primary"
+                    if st.button(btn_label, key=f"btn_done_{i}", type=btn_type, use_container_width=True):
+                        stop["completed"] = not is_done
+                        autosave_session()
+                        st.rerun()
+
+                    # Botões de navegação rápida
+                    lat, lng = stop['centroid']['lat'], stop['centroid']['lng']
+                    col_waze, col_maps = st.columns(2)
+                    with col_waze:
+                        st.link_button("🚙 Waze", build_waze_url(lat, lng), use_container_width=True)
+                    with col_maps:
+                        st.link_button("🗺 Google Maps", f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}", use_container_width=True)
+
                     st.markdown(f"""<div class="info-card">
                         <div style='margin-bottom:8px; font-weight:700; color:#ff9f1c; border-bottom:1px solid #333; padding-bottom:4px;'>
                             📦 Zona: {zone} <span style='font-weight:400; color:#aaa; font-size:0.8em'>({items_per_stop} itens est.)</span>

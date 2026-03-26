@@ -216,6 +216,8 @@ for key, default in {
     "origin_label": "",
     "geocoded_points": [],
     "route_ready": False,
+    "average_urban_speed_kmh": 25, # Nova entrada para velocidade média urbana
+    "_osrm_distance_cache": {}, # Cache em memória para distâncias OSRM
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -267,6 +269,31 @@ def load_route_db(route_id: int) -> Optional[dict]:
     row = c.fetchone()
     conn.close()
     return json.loads(row[0]) if row else None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OSRM DISTANCE CACHE
+# ─────────────────────────────────────────────────────────────────────────────
+OSRM_DISTANCE_CACHE_FILE = "osrm_distance_cache.json"
+
+def load_osrm_distance_cache() -> dict:
+    if not os.path.exists(OSRM_DISTANCE_CACHE_FILE):
+        return {}
+    try:
+        with open(OSRM_DISTANCE_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_osrm_distance_cache(new_data: dict):
+    """Atualiza o cache persistente de distâncias OSRM."""
+    cache = load_osrm_distance_cache()
+    cache.update(new_data)
+    try:
+        with open(OSRM_DISTANCE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Erro ao salvar cache de distâncias OSRM: {e}")
+
 
 init_db()
 
@@ -328,18 +355,30 @@ def haversine_m(a: dict, b: dict) -> float:
          * math.sin(dlng / 2) ** 2)
     return R * 2 * math.atan2(math.sqrt(x), math.sqrt(1 - x))
 
-def get_osrm_distance_value(c1: dict, c2: dict) -> float:
+def get_osrm_distance_value(c1: dict, c2: dict, use_cache: bool = True) -> float:
     """
     Retorna distância de direção em metros entre duas coordenadas via OSRM.
     Retorna haversine como fallback em caso de falha da API.
     """
+    # Cria uma chave de cache consistente, independente da ordem de c1 e c2
+    coords_key = tuple(sorted([(c1['lat'], c1['lng']), (c2['lat'], c2['lng'])]))
+    
+    if use_cache and coords_key in st.session_state._osrm_distance_cache:
+        return st.session_state._osrm_distance_cache[coords_key]
+
     url = f"http://router.project-osrm.org/route/v1/driving/{c1['lng']},{c1['lat']};{c2['lng']},{c2['lat']}?overview=false"
     try:
         r = requests.get(url, timeout=2)
         if r.status_code == 200:
             data = r.json()
             if "routes" in data and len(data["routes"]) > 0:
-                return float(data["routes"][0]["distance"])
+                distance = float(data["routes"][0]["distance"])
+                if use_cache:
+                    st.session_state._osrm_distance_cache[coords_key] = distance
+                    # Salva no disco a cada X novas entradas ou a cada Y minutos para evitar I/O excessivo
+                    # Por simplicidade, vamos salvar a cada nova entrada por enquanto.
+                    save_osrm_distance_cache({str(coords_key): distance})
+                return distance
     except:
         pass
     return haversine_m(c1, c2)
@@ -469,18 +508,22 @@ def cluster_points_kmeans(points: list, k: int) -> list:
         })
     return clusters
 
-def solve_tsp_nn(origin: dict, clusters: list) -> list:
-    """Nearest-Neighbour heuristic for TSP. Returns ordered list of clusters."""
+def solve_tsp_nn(origin: dict, clusters: list, use_osrm: bool = False) -> list:
+    """
+    Heurística do Vizinho Mais Próximo para o TSP.
+    Melhoria: Usa Haversine por padrão para evitar milhares de chamadas de API (lento).
+    """
     remaining = list(range(len(clusters)))
     route = []
     current = origin
+    dist_fn = get_osrm_distance_value if use_osrm else haversine_m
+
     while remaining:
-        nearest_idx = min(remaining, key=lambda i: get_osrm_distance_value(current, clusters[i]["centroid"]))
+        nearest_idx = min(remaining, key=lambda i: dist_fn(current, clusters[i]["centroid"]))
         route.append(clusters[nearest_idx])
         current = clusters[nearest_idx]["centroid"]
         remaining.remove(nearest_idx)
     return route
-
 
 def total_distance_km(origin: dict, stops: list) -> float:
     dist = 0.0
@@ -488,7 +531,11 @@ def total_distance_km(origin: dict, stops: list) -> float:
     for s in stops:
         dist += haversine_m(prev, s["centroid"])
         prev = s["centroid"]
-    return dist / 1000
+    
+    # Se o TSP foi desativado, a distância OSRM é usada para o cálculo total
+    if not st.session_state.use_tsp:
+        dist = get_osrm_distance_value(origin, stops[0]["centroid"]) + sum(get_osrm_distance_value(stops[i]["centroid"], stops[i+1]["centroid"]) for i in range(len(stops)-1))
+    return dist / 1000 # Retorna em KM
 
 def get_cargo_zone(stop_idx: int) -> str:
     """Define a zona de carregamento baseada na ordem de entrega (Lógica do car_load.py)."""
@@ -555,7 +602,7 @@ def check_image_issues(file_bytes: bytes) -> list[str]:
         pass
     return issues
 
-def optimize_image(image_bytes: bytes, max_size: int = 1280, quality: int = 85) -> bytes:
+def optimize_image(image_bytes: bytes, max_size: int = 1024, quality: int = 75) -> bytes:
     """
     Redimensiona e otimiza imagens para reduzir uso de memória (celular) e payload de API.
     Converte para JPEG e limita dimensão máxima.
@@ -645,6 +692,25 @@ def geocode(address: str, context: str = "") -> Optional[dict]:
             }
 
     return None
+
+def geocode_reverse(lat_data, long_data) -> Optional[dict]:
+    """
+    Geocodifica um endereço. Tenta primeiro o endereço exato.
+    Tenta variações de formatação (hífen vs vírgula).
+    Se falhar o número, tenta buscar apenas a rua (approx).
+    Retorna também o tipo de match: 'exact' ou 'context'.
+    """
+    #clean_addr = address.strip().strip(",.-")
+    url = f"https://nominatim.openstreetmap.org/reverse?format=geocodejson&lat={lat_data}&lon={long_data}&zoom=18&addressdetails=1&layer=address"
+    headers = {"Accept-Language": "pt-BR", "User-Agent": "RotaMax/1.0"}
+
+
+    try:
+        r = requests.get(url, params={"limit": 1}, headers=headers, timeout=10)
+        return r.json() if r.status_code == 200 else None
+    except:
+        return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEMINI AI — EXTRACT ADDRESSES FROM IMAGE
@@ -1144,13 +1210,15 @@ with st.sidebar:
         env_lng = float(os.getenv("DEFAULT_ORIGIN_LNG", -46.633308))
         env_city_ctx = os.getenv("DEFAULT_CITY_CONTEXT", "")
 
-        api_key = ""
+        api_key = env_gemini
         selected_model = ""
         if provider == "Claude":
-            api_key = st.text_input("🔑 Chave API Anthropic", value=env_claude, type="password", help="Necessária para Claude")
+            api_key = st.text_input("🔑 Chave API Anthropic", type="password", help="Necessária para Claude")
             selected_model = st.text_input("Modelo Claude", value=def_claude_model)
         elif provider == "Gemini":
-            api_key = st.text_input("🔑 Chave API Gemini", value=env_gemini, type="password", help="Necessária para Gemini")
+            api_key_input = st.text_input("🔑 Chave API Gemini", type="password", help="Necessária para Gemini")
+            if api_key == "":
+                api_key = env_gemini
             selected_model = st.text_input("Modelo Gemini", value=def_gemini_model)
         else:
             # Configurações Ollama
@@ -1220,7 +1288,7 @@ with st.sidebar:
     if 'lng_in' not in st.session_state:
         st.session_state.lng_in = env_lng
 
-    if st.checkbox("📍 Obter GPS do Dispositivo", help="Ative para buscar sua localização atual"):
+    if st.session_state["lat_in"] and   st.session_state["lng_in"] not in st.session_state:
         geo_loc = get_geolocation(component_key='get_gps_loc')
         geo_data = geo_loc["coords"] if geo_loc else None
         geo_data_lat = geo_data["latitude"] if geo_data else None
@@ -1230,20 +1298,35 @@ with st.sidebar:
             st.session_state["lng_in"] = geo_data_lng
             
         st.caption("Localização Capturada:")
-        #st.write(f"Lat: {st.session_state.lat_in:.5f} | Lng: {st.session_state.lng_in:.5f}")
+        addr_geo_loc = geocode_reverse( st.session_state["lat_in"], st.session_state["lng_in"])
+        if addr_geo_loc:            
+            if "features" in addr_geo_loc and len(addr_geo_loc["features"]) > 0:
+                properties = addr_geo_loc["features"][0].get("properties", {})
+                geocoding = properties.get("geocoding", {})
+                label = geocoding.get("name", "Endereço não identificado")
+                bairro = geocoding.get("district", "Bairro não identificado")
+                city = geocoding.get("city", "Cidade não identificada")
+                state = geocoding.get("state", "Estado não identificado")
+                st.write(f"📍 {label} - {bairro}")
+                st.caption(f"{city} - {state}")
+            else:
+                st.write("Endereço não identificado")
     col_gps1, col_gps2 = st.columns([1, 1])
     with col_gps1:
         lat_in = st.number_input("Latitude", value=st.session_state.lat_in, format="%.5f", key="lat_in")
     with col_gps2:
         lng_in = st.number_input("Longitude", value=st.session_state.lng_in, format="%.5f", key="lng_in")
 
-    if st.button(" Confirmar/Usar Coordenadas", width='stretch'):
-        if lat_in != 0.0 and lng_in != 0.0:
-            st.session_state.origin_coords = {"lat": lat_in, "lng": lng_in}
-            st.session_state.origin_label = f"GPS ({lat_in:.5f}, {lng_in:.5f})"
-            st.success("Coordenadas GPS salvas!")
-        else:
-            st.warning("Preencha lat/lng válidos.")
+   
+    if lat_in != 0.0 and lng_in != 0.0:
+        st.session_state.origin_coords = {"lat": lat_in, "lng": lng_in}
+        st.session_state.origin_label = f"GPS ({lat_in:.5f}, {lng_in:.5f})"
+        st.success("Coordenadas GPS salvas!")
+    else:
+        st.session_state.origin_coords = None # Limpa se os valores forem inválidos
+        st.warning("Preencha lat/lng válidos.")
+
+    st.divider()
 
     st.markdown('<div class="card-title">Restaurar Última Sessão</div>', unsafe_allow_html=True)
     # Botão de Restaurar Sessão (se existir autosave)
@@ -1251,8 +1334,20 @@ with st.sidebar:
         if st.button("♻️ Restaurar Sessão", help="Recarrega endereços e rotas salvos automaticamente."):
             load_autosave()
             st.success("Sessão restaurada!")
+            st.session_state._osrm_distance_cache = load_osrm_distance_cache() # Carrega cache OSRM
             time.sleep(1)
             st.rerun()
+
+    # ── LIMPAR CACHE OSRM ───────────────────────────────────────────────────
+    st.markdown('<div class="card-title">Manutenção</div>', unsafe_allow_html=True)
+    if st.button("🗑 Limpar Cache OSRM", help="Apaga o cache de distâncias do OSRM para forçar novas consultas à API."):
+        st.session_state._osrm_distance_cache = {}
+        if os.path.exists(OSRM_DISTANCE_CACHE_FILE):
+            os.remove(OSRM_DISTANCE_CACHE_FILE)
+        st.success("Cache OSRM limpo!")
+        # Recarrega o cache do disco (que agora está vazio)
+        st.session_state._osrm_distance_cache = load_osrm_distance_cache()
+        st.rerun()
 
     # ── ROTAS SALVAS (DB) ──
     st.markdown('<div class="card-title">Restaurar Rotas Salvas</div>', unsafe_allow_html=True)
@@ -1269,6 +1364,7 @@ with st.sidebar:
                         data = load_route_db(rid)
                         if data:
                             for k, v in data.items():
+                                # Não sobrescreve o cache OSRM da sessão
                                 st.session_state[k] = v
                             st.success("Carregada!")
                             time.sleep(0.5)
@@ -1280,12 +1376,16 @@ with st.sidebar:
                 st.markdown("<hr style='margin:4px 0;border-color:#333'>", unsafe_allow_html=True)
         else:
             st.info("Nenhuma rota salva.")
+    
+    st.divider()
 
     # ── CLUSTERING THRESHOLD ─────────────────────────────────────────────────
     st.markdown('<div class="card-title">Parâmetros Clusterização</div>', unsafe_allow_html=True)
     
     clustering_algo = st.selectbox("Algoritmo de Agrupamento", ["Simples (Greedy)", "DBSCAN", "K-Means"], key="clustering_algo", index=0, help="Algoritimo para junção de endereços em paradas unicas(Cluster)")
-    
+
+    st.session_state.use_tsp = st.checkbox("Otimizar Ordem (TSP)", value=True, help="Se marcado, calcula a melhor sequência de entrega. Se desmarcado, mantém a ordem do upload.")
+
     cluster_thresh = 60
     min_samples = 2
     kmeans_k = 5
@@ -1296,42 +1396,49 @@ with st.sidebar:
         cluster_thresh = st.slider("Raio (eps) metros", 25, 200, 50, 10)
         min_samples = st.slider("Mínimo de Pontos (MinPts)", 1, 5, 2)
     elif clustering_algo == "K-Means":
+        # Garante que k não seja maior que o número de endereços disponíveis
+        # e que seja no mínimo 1 se houver endereços.
+        # Se não houver endereços, k pode ser 1 (ou 0, dependendo da lógica)
         max_k = len(st.session_state.addresses) if st.session_state.addresses else 10
         kmeans_k = st.slider("Número de Paradas (K)", 1, max(2, max_k), max(1, max_k//3))
     
     st.divider()
+    with st.expander(f'Lista de Endereços ({len(st.session_state.addresses)})', expanded=False):
+        # ── ADDRESS LIST ─────────────────────────────────────────────────────────
+        if st.session_state.addresses:
+            st.markdown(f'<div class="card-title">Endereços ({len(st.session_state.addresses)})</div>',
+                        unsafe_allow_html=True)
+            for i, a in enumerate(st.session_state.addresses):
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.markdown(f'<div class="addr-pill"><div class="addr-dot"></div>{a[:38]}{"…" if len(a)>38 else ""}</div>',
+                                unsafe_allow_html=True)
+                with c2:
+                    if st.button("✕", key=f"del_{i}"):
+                        st.session_state.addresses.pop(i)
+                        st.rerun()
 
-    # ── ADDRESS LIST ─────────────────────────────────────────────────────────
-    if st.session_state.addresses:
-        st.markdown(f'<div class="card-title">Endereços ({len(st.session_state.addresses)})</div>',
-                    unsafe_allow_html=True)
-        for i, a in enumerate(st.session_state.addresses):
-            c1, c2 = st.columns([5, 1])
-            with c1:
-                st.markdown(f'<div class="addr-pill"><div class="addr-dot"></div>{a[:38]}{"…" if len(a)>38 else ""}</div>',
-                            unsafe_allow_html=True)
-            with c2:
-                if st.button("✕", key=f"del_{i}"):
-                    st.session_state.addresses.pop(i)
-                    st.rerun()
+            if st.button("♻ Remover Duplicatas", width='stretch'):
+                seen = set()
+                unique_list = []
+                for addr in st.session_state.addresses:
+                    # Normalização para comparação (lowercase + espaços)
+                    norm = " ".join(addr.split()).lower()
+                    if norm not in seen:
+                        seen.add(norm)
+                        unique_list.append(addr)
+                st.session_state.addresses = unique_list
+                st.rerun()
 
-        if st.button("♻ Remover Duplicatas", width='stretch'):
-            seen = set()
-            unique_list = []
-            for addr in st.session_state.addresses:
-                # Normalização para comparação (lowercase + espaços)
-                norm = " ".join(addr.split()).lower()
-                if norm not in seen:
-                    seen.add(norm)
-                    unique_list.append(addr)
-            st.session_state.addresses = unique_list
-            st.rerun()
+            if st.button("🗑 Limpar Todos", width='stretch', type="secondary"):
+                st.session_state.addresses.clear()
+                st.session_state.stops.clear()
+                st.session_state.route_ready = False
+                st.rerun()
 
-        if st.button("🗑 Limpar Todos", width='stretch', type="secondary"):
-            st.session_state.addresses.clear()
-            st.session_state.stops.clear()
-            st.session_state.route_ready = False
-            st.rerun()
+    st.markdown('<div class="card-title">Configurações de Rota</div>', unsafe_allow_html=True)
+    st.session_state.average_urban_speed_kmh = st.slider("Velocidade Média Urbana (km/h)", 10, 60, value=st.session_state.average_urban_speed_kmh, help="Usada para estimar o tempo total da rota.")
+    #st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN CONTENT
@@ -1353,125 +1460,112 @@ tab_upload, tab_route, tab_nav, tab_export = st.tabs(["📂 Upload & Extração"
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_upload:
     st.markdown("### Upload de Arquivos")
-    st.markdown("Envie **imagens/PDFs** (com endereços) ou um **CSV**.")
+    
+    col_u1, col_u2 = st.columns([2, 1])
+    with col_u1:
+        uploaded = st.file_uploader(
+            "Selecione arquivos (Imagens, PDF ou CSV)",
+            type=["jpg", "jpeg", "png", "webp", "pdf", "csv"],
+            accept_multiple_files=True,
+            help="No celular, prefira enviar poucas imagens por vez para evitar travamentos."
+        )
+    with col_u2:
+        camera_photo = st.camera_input("Tirar Foto")
 
-    uploaded = st.file_uploader(
-        "Selecione arquivos",
-        type=["jpg", "jpeg", "png", "gif", "webp", "pdf", "csv"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-    )
-
+    # Consolida as fontes de entrada
+    files_to_process = []
     if uploaded:
+        files_to_process.extend(uploaded)
+    if camera_photo:
+        files_to_process.append(camera_photo)
+
+    if files_to_process:
         col_proc, col_clear = st.columns([1, 1])
         with col_proc:
             do_extract = st.button("⚡ Extrair Endereços", type="primary", width='stretch')
         with col_clear:
             if st.button("✕ Limpar Arquivos", width='stretch'):
+                st.session_state.addresses = []
                 st.rerun()
 
         if do_extract:
             progress = st.progress(0, text="Iniciando extração…")
             new_found = []
 
-            for idx, f in enumerate(uploaded):
-                progress.progress((idx) / len(uploaded), text=f"Processando {f.name}…")
-                raw = f.read()
+            for idx, f in enumerate(files_to_process):
+                progress.progress((idx) / len(files_to_process), text=f"Processando {f.name}…")
+                
+                # Lê os bytes uma única vez
+                raw = f.getvalue()
+                file_hash = get_file_hash(raw)
 
                 if f.name.lower().endswith(".csv"):
                     addrs = extract_addresses_from_csv(raw, f.name)
-                    # Normaliza endereços do CSV
                     addrs_norm = [normalize_address(a) for a in addrs]
                     new_found.extend(addrs_norm)
                     st.success(f"CSV processado: {len(addrs)} endereços.")
+                    del raw # Libera memória
                 else:
-                    # Validação de credenciais antes de processar
                     if provider != "Ollama" and not api_key:
                         st.markdown('<div class="status-warn">⚠ Chave API necessária para processar imagens.</div>',
                                     unsafe_allow_html=True)
                         continue
 
-                    # ── CHECK CACHE FIRST (Avoid reprocessing) ──
-                    cached_res = get_cached_addresses(raw)
+                    cached_res = get_cached_addresses(file_hash)
                     if cached_res is not None:
                         new_found.extend(cached_res)
                         st.markdown(f'<div class="status-ok">⚡ Cache "{f.name}" → {len(cached_res)} endereço(s)</div>',
                                     unsafe_allow_html=True)
                         time.sleep(0.1)
                         continue
-                    # ────────────────────────────────────────────
 
-                    # Lógica para tratar Imagem ou PDF
-                    images_to_process = [] # Lista de tuplas (bytes, mime_type, label)
-                    
-                    # Otimiza a imagem "crua" se não for PDF nem CSV
-                    if not f.name.lower().endswith(".pdf"):
-                        raw = optimize_image(raw)
-                    
+                    # Processamento sequencial para economizar RAM
                     if f.name.lower().endswith(".pdf"):
                         try:
-                            # Converte páginas do PDF em imagens
                             pil_images = convert_from_bytes(raw)
                             for p_idx, p_img in enumerate(pil_images):
                                 buf = io.BytesIO()
                                 p_img.save(buf, format="JPEG")
-                                # Otimiza também as páginas do PDF
-                                optimized_page = optimize_image(buf.getvalue())
-                                images_to_process.append((optimized_page, "image/jpeg", f"Pág {p_idx+1}"))
+                                page_bytes = optimize_image(buf.getvalue())
+                                
+                                # Extração imediata por página
+                                if provider == "Gemini":
+                                    p_addrs = extract_addresses_from_image_gemini(page_bytes, "image/jpeg", api_key, selected_model)
+                                elif provider == "Ollama":
+                                    p_addrs = extract_addresses_from_image_ollama(page_bytes, "image/jpeg", selected_model, ollama_host)
+                                else:
+                                    p_addrs = extract_addresses_from_image(page_bytes, "image/jpeg", api_key, selected_model)
+                                
+                                p_final = [normalize_address(a) for a in expand_multi_addresses(p_addrs)]
+                                new_found.extend(p_final)
+                                del page_bytes, buf # Limpeza agressiva
                         except Exception as e:
                             st.error(f"Erro ao converter PDF {f.name}: {e}")
-                            continue
                     else:
-                        mime = f.type or "image/jpeg"
-                        images_to_process.append((raw, mime, "Imagem"))
-
-                    # Verificação de qualidade da imagem (apenas se for imagem pura, não PDF convertido)
-                    if not f.name.lower().endswith(".pdf"):
+                        # Otimiza imagem única
+                        optimized_raw = optimize_image(raw)
                         issues = check_image_issues(raw)
                         if issues:
                             for issue in issues:
                                 st.warning(f"⚠ Alerta em '{f.name}': {issue}")
 
-                    try:
-                        total_file_addrs = []
-                        
-                        for img_bytes, img_mime, label in images_to_process:
+                        try:
+                            mime = f.type or "image/jpeg"
                             if provider == "Gemini":
-                                addrs = extract_addresses_from_image_gemini(img_bytes, img_mime, api_key, selected_model)
+                                addrs = extract_addresses_from_image_gemini(optimized_raw, mime, api_key, selected_model)
                             elif provider == "Ollama":
-                                addrs = extract_addresses_from_image_ollama(img_bytes, img_mime, selected_model, ollama_host)
+                                addrs = extract_addresses_from_image_ollama(optimized_raw, mime, selected_model, ollama_host)
                             else:
-                                addrs = extract_addresses_from_image(img_bytes, img_mime, api_key, selected_model)
+                                addrs = extract_addresses_from_image(optimized_raw, mime, api_key, selected_model)
 
-                            # Processa múltiplos números (ex: "Rua X, 10, 20")
-                            addrs_processed = expand_multi_addresses(addrs)
-                            
-                            # Normaliza APÓS expandir (aplica Juiz de Fora aqui)
-                            addrs_final = [normalize_address(a) for a in addrs_processed]
-                            
-                            total_file_addrs.extend(addrs_final)
+                            addrs_final = [normalize_address(a) for a in expand_multi_addresses(addrs)]
                             new_found.extend(addrs_final)
+                            save_to_cache(file_hash, addrs_final)
+                        except Exception as e:
+                            st.error(f"Erro na extração ({f.name}): {e}")
+                        
+                        del optimized_raw, raw # Libera memória do arquivo original e otimizado
 
-
-
-                            # Show thumbnail + results per page/image
-                            c1, c2 = st.columns([1, 4])
-                            with c1:
-                                st.image(img_bytes, caption=f"{f.name} ({label})", width=120)
-                            with c2:
-                                if addrs:
-                                    for a in addrs:
-                                        st.markdown(f'<div class="addr-pill"><div class="addr-dot"></div>{a}</div>',
-                                            unsafe_allow_html=True)
-                                else:
-                                    st.caption(f"Nenhum endereço encontrado em {label}")
-
-                        # Save to cache if successful
-                        if total_file_addrs:
-                            save_to_cache(get_file_hash(raw), total_file_addrs)
-
-                    except Exception as e:
-                        st.error(f"Erro na extração ({provider}): {e}")
 
                 time.sleep(0.3)  # small delay between calls
 
@@ -1578,7 +1672,7 @@ with tab_route:
                             "display": coords.get("display")
                         }
                     else:
-                        st.warning(f"Não geocodificado: {addr}")
+                        st.toast(f"Não geocodificado: {addr}", icon="⚠️", duration='infinite')
                         # Adiciona como erro para permitir edição manual posterior
                         points.append({
                             "address": addr,
@@ -1615,8 +1709,12 @@ with tab_route:
                         clusters = cluster_points(valid_points, threshold_m=cluster_thresh)
 
                 # Step 3: TSP
-                with st.spinner("Calculando rota TSP…", show_time=True):
-                    ordered_stops = solve_tsp_nn(origin, clusters)
+                if st.session_state.use_tsp:
+                    with st.spinner("Calculando rota TSP…", show_time=True):
+                        ordered_stops = solve_tsp_nn(origin, clusters)
+                else:
+                    ordered_stops = clusters
+                    st.info("Otimização TSP desativada. A ordem das paradas segue a ordem de upload.")
 
                 st.session_state.stops = ordered_stops
                 st.session_state.geocoded_points = points
@@ -1756,11 +1854,12 @@ with tab_route:
                                 clusters = cluster_points_kmeans(valid_points_refresh, k=kmeans_k)
                             else:
                                 clusters = cluster_points(valid_points_refresh, threshold_m=cluster_thresh)
-                                
-                            st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, clusters)
+                            
+                            # Recalcula TSP apenas se estiver ativo
+                            st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, clusters, use_osrm=not st.session_state.use_tsp)
                             autosave_session() # Salva após edição manual
                             st.rerun()
-            else:
+            elif approx_points: # Only show if there were points to adjust, but they are all resolved
                 with st.popover("⚠️ Sem Endereços para Ajustar ", width='stretch', disabled=True):
                     pass
     with col_mid_tab_route[1]:
@@ -1795,14 +1894,18 @@ with tab_route:
 
             # Metrics
             total_km = total_distance_km(origin, stops)
+            estimated_time_hours = total_km / st.session_state.average_urban_speed_kmh
+            estimated_time_minutes = estimated_time_hours * 60
             total_addr = sum(len(s["members"]) for s in stops)
             clusters_count = sum(1 for s in stops if s["is_cluster"])
+            
     if st.session_state.route_ready and st.session_state.stops and st.session_state.origin_coords:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         for col, val, lbl in zip(
-            [c1, c2, c3, c4],
-            [len(stops), total_addr, clusters_count, f"{total_km:.1f} km"],
-            ["Paradas", "Endereços", "Agrupamentos", "Dist. Total"],
+            [c1, c2, c3, c4, c5],
+            [len(stops), total_addr, clusters_count, f"{total_km:.1f} km", 
+             f"{int(estimated_time_hours)}h {int(estimated_time_minutes % 60)}m"],
+            ["Paradas", "Endereços", "Agrupamentos", "Dist. Total", "Tempo Est."],
         ):
             with col:
                 st.markdown(f"""<div class="metric-box">

@@ -901,6 +901,42 @@ def extract_addresses_from_csv(file_bytes: bytes, filename: str) -> list[str]:
 
     return df[chosen_col].dropna().astype(str).str.strip().tolist()
 
+def extract_data_from_xlsx(file_bytes: bytes) -> list[dict]:
+    """
+    Extrai endereços e coordenadas de um arquivo Excel.
+    Retorna uma lista de dicionários com chaves: address, lat, lng.
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    except Exception as e:
+        st.error(f"Erro ao ler Excel: {e}")
+        return []
+
+    cols = df.columns.tolist()
+    
+    # Mapeamento flexível de colunas
+    addr_col = next((c for c in cols if any(k in c.lower() for k in ["endereco", "endereço", "address", "rua"])), None)
+    lat_col = next((c for c in cols if any(k in c.lower() for k in ["lat", "latitude"])), None)
+    lng_col = next((c for c in cols if any(k in c.lower() for k in ["lng", "long", "longitude"])), None)
+    info_col = next((c for c in cols if any(k in c.lower() for k in ["nome", "cliente", "pedido", "order"])), None)
+
+    results = []
+    for _, row in df.iterrows():
+        addr = str(row[addr_col]).strip() if addr_col and pd.notnull(row[addr_col]) else ""
+        if not addr: continue
+
+        # Captura o metadado (ID/Nome) separadamente para não poluir a busca
+        extra_info = str(row[info_col]).strip() if info_col and pd.notnull(row[info_col]) else None
+        
+        results.append({
+            "address": normalize_address(addr),
+            "lat": float(row[lat_col]) if lat_col and pd.notnull(row[lat_col]) else None,
+            "lng": float(row[lng_col]) if lng_col and pd.notnull(row[lng_col]) else None,
+            "extra_info": extra_info,
+            "original_addr": addr
+        })
+    return results
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOCAL CACHE SYSTEM
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1068,6 +1104,8 @@ def build_map(origin: dict, stops: list) -> folium.Map:
             lat_jit = rng.uniform(-0.0001, 0.0001)
             lng_jit = rng.uniform(-0.0001, 0.0001)
             
+            extra_label = f"<b>[{member['extra_info']}]</b> " if member.get("extra_info") else ""
+
             folium.CircleMarker(
                 location=[member["coords"]["lat"] + lat_jit, member["coords"]["lng"] + lng_jit],
                 radius=4,
@@ -1077,7 +1115,7 @@ def build_map(origin: dict, stops: list) -> folium.Map:
                 fill_color=bg_color,
                 fill_opacity=0.9,
                 tooltip=member["address"],
-                popup=folium.Popup(f"<div style='font-size:12px'>{member['address']}</div>", max_width=200)
+                popup=folium.Popup(f"<div style='font-size:12px'>{extra_label}{member['address']}</div>", max_width=200)
             ).add_to(m)
             
             # Se for um cluster, conecta o endereço ao centróide da parada
@@ -1090,7 +1128,7 @@ def build_map(origin: dict, stops: list) -> folium.Map:
                     color=bg_color, weight=1, opacity=0.5, dash_array="3 3"
                 ).add_to(m)
 
-        members_html = "".join(f"<li style='margin:2px 0;font-size:12px'>{m['address']}</li>" for m in stop["members"])
+        members_html = "".join(f"<li style='margin:2px 0;font-size:12px'>{'<b>['+str(m['extra_info'])+']</b> ' if m.get('extra_info') else ''}{m['address']}</li>" for m in stop["members"])
         popup_html = f"""
         <b>Parada {i}</b>{'  📦 Agrupada' if stop['is_cluster'] else ''}<br>
         <ul style='padding-left:14px;margin:6px 0'>{members_html}</ul>
@@ -1464,8 +1502,8 @@ with tab_upload:
     col_u1, col_u2 = st.columns([2, 1])
     with col_u1:
         uploaded = st.file_uploader(
-            "Selecione arquivos (Imagens, PDF ou CSV)",
-            type=["jpg", "jpeg", "png", "webp", "pdf", "csv"],
+            "Selecione arquivos (Imagens, PDF, CSV ou Excel)",
+            type=["jpg", "jpeg", "png", "webp", "pdf", "csv", "xlsx"],
             accept_multiple_files=True,
             help="No celular, prefira enviar poucas imagens por vez para evitar travamentos."
         )
@@ -1504,6 +1542,26 @@ with tab_upload:
                     addrs_norm = [normalize_address(a) for a in addrs]
                     new_found.extend(addrs_norm)
                     st.success(f"CSV processado: {len(addrs)} endereços.")
+                    del raw
+                elif f.name.lower().endswith(".xlsx"):
+                    data_list = extract_data_from_xlsx(raw)
+                    count_coords = 0
+                    for item in data_list:
+                        addr = item["address"]
+                        if addr not in st.session_state.addresses:
+                            st.session_state.addresses.append(addr)
+                            # Se já tem coordenadas, injeta direto no cache de geocodificação da sessão
+                            if item["lat"] is not None and item["lng"] is not None:
+                                pt_obj = {
+                                    "address": addr,
+                                    "coords": {"lat": item["lat"], "lng": item["lng"]},
+                                    "type": "exact",
+                                    "display": addr,
+                                    "extra_info": item.get("extra_info")
+                                }
+                                st.session_state.geocoded_points.append(pt_obj)
+                                count_coords += 1
+                    st.success(f"Excel processado: {len(data_list)} endereços ({count_coords} com GPS).")
                     del raw # Libera memória
                 else:
                     if provider != "Ollama" and not api_key:

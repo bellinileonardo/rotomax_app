@@ -2009,13 +2009,11 @@ with tab_route:
 
     st.markdown("---")
     if st.session_state.route_ready and st.session_state.stops and st.session_state.origin_coords:
-        # Map + Stop list side by side
-        col_btn_tab_route = st.columns([3, 2])
-
         with st.container():
             st.markdown("#### 🗺 Mapa da Rota")
             st.caption("Para corrigir um local, selecione o Marcador (📍) no mapa e clique na posição correta.")
-            fmap = build_map(origin, stops)
+            # Usar session_state diretamente evita o erro de variável não definida (NameError)
+            fmap = build_map(st.session_state.origin_coords, st.session_state.stops)
             
             # 'returned_objects' limita o que volta do frontend. 
             # Removendo zoom/bounds do retorno evita recarregamento da página ao interagir com o mapa.
@@ -2074,7 +2072,7 @@ with tab_route:
 
         col_btn_tab_route = st.columns([1,3,3])
         with col_btn_tab_route[0]:
-            total_vols = st.number_input("Total de Volumes (Opcional)", min_value=1, value=len(stops), help="Para calcular média de itens por parada")
+            total_vols = st.number_input("Total de Volumes (Opcional)", min_value=1, value=len(st.session_state.stops), help="Para calcular média de itens por parada")
 
         with col_btn_tab_route[1]:
             st.space(10)
@@ -2082,9 +2080,9 @@ with tab_route:
                 # Input opcional para cálculo de itens por parada
                 stops = st.session_state.stops
                 
-                items_per_stop = math.ceil(total_vols / len(stops))
+                items_per_stop = math.ceil(total_vols / len(st.session_state.stops))
 
-                for i, stop in enumerate(stops, start=1):
+                for i, stop in enumerate(st.session_state.stops, start=1):
                     is_done = stop.get("completed", False)
                     
                     badge_class = "cluster" if stop["is_cluster"] else ""
@@ -2141,7 +2139,7 @@ with tab_route:
             st.space(10)
             if st.button("📄 Baixar Relatório PDF (HTML)", width='stretch', type="primary"):
                 # 1. Gera o mapa
-                m_report = build_map(origin, stops)
+                m_report = build_map(st.session_state.origin_coords, st.session_state.stops)
                 full_html = m_report.get_root().render()
 
                 # Preparação para o Plano de Etiquetas por Zona no Relatório
@@ -2245,7 +2243,7 @@ with tab_route:
 with tab_nav:
     st.markdown("### 📍 Navegação Ponto a Ponto")
     
-    if not st.session_state.route_ready:
+    if not st.session_state.route_ready or not st.session_state.stops:
         st.markdown('<div class="status-warn">⚠ Gere a rota primeiro na aba "Rota Otimizada".</div>',
                     unsafe_allow_html=True)
     else:

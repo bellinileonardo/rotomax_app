@@ -2216,7 +2216,7 @@ with tab_route:
 
                 custom_content = f"""
                 <div id="report-container">
-                    <div class="rep-header"><h1>Relatório RotaMax</h1><p>Partida: {origin.get('label','GPS')} • Paradas: {len(stops)}</p></div>
+                    <div class="rep-header"><h1>Relatório RotaMax</h1><p>Partida: {origin.get('label','GPS')} • Paradas: {len(st.session_state.stops)}</p></div>
                     {car_html}{cargo_plan_html}<div class="rep-list">{rows_html}</div>
                 </div>
                 <style>
@@ -2323,60 +2323,3 @@ with tab_export:
                         st.code("\n".join(etiquetas), language=None)
                     else:
                         st.caption("Nenhuma etiqueta")
-
-        # Cria abas internas para organizar a exportação
-        exp_tabs = st.tabs(["🗺 Google Maps (Rota)", "💾 CSV/JSON"])
-
-        # ── TAB: GOOGLE MAPS ──────────────────────────────────────────────
-        with exp_tabs[0]:
-            st.markdown("#### Rota Sequencial")
-            gmaps_url = build_gmaps_url(origin, stops)
-            st.info("Google Maps suporta até 10 waypoints no link direto. Paradas excedentes serão ignoradas na prévia, mas estão completas nos arquivos.")
-            st.link_button("🗺 Abrir no Google Maps", gmaps_url, width='stretch', type="primary")
-            st.text_area("Link direto", gmaps_url, height=70)
-
-        # ── TAB: CSV / JSON ───────────────────────────────────────────────
-        with exp_tabs[1]:
-            st.markdown("#### Arquivos de Dados")
-            
-            # Preparar dados CSV
-            rows = []
-            for i, stop in enumerate(stops, start=1):
-                for m in stop["members"]:
-                    rows.append({
-                        "Parada": i,
-                        "Tipo": "Agrupada" if stop["is_cluster"] else "Individual",
-                        "Endereço": m["address"],
-                        "Etiqueta (Stop)": m.get("stop_label"),
-                        "Sequência": m.get("sequence"),
-                        "Info Extra": m.get("extra_info"),
-                        "Lat": stop["centroid"]["lat"],
-                        "Lng": stop["centroid"]["lng"],
-                        "Link Waze": build_waze_url(stop["centroid"]["lat"], stop["centroid"]["lng"])
-                    })
-            df_export = pd.DataFrame(rows)
-            csv_bytes = df_export.to_csv(index=False).encode("utf-8")
-
-            # Preparar JSON
-            pins = []
-            for i, stop in enumerate(stops, start=1):
-                pins.append({
-                    "pin": i,
-                    "lat": stop["centroid"]["lat"],
-                    "lng": stop["centroid"]["lng"],
-                    "type": "cluster" if stop["is_cluster"] else "single",
-                    "addresses": [m["address"] for m in stop["members"]],
-                })
-            json_bytes = json.dumps({"origin": origin, "stops": pins}, ensure_ascii=False, indent=2).encode("utf-8")
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button("⬇ Baixar Planilha (.csv)", data=csv_bytes,
-                                file_name="rotamax_rota.csv", mime="text/csv", width='stretch')
-            with c2:
-                st.download_button("⬇ Baixar JSON (.json)", data=json_bytes,
-                                file_name="rotamax_pins.json", mime="application/json", width='stretch')
-            
-            st.markdown("##### Prévia dos Dados")
-            st.dataframe(df_export, width='stretch', hide_index=True, height=250, 
-                         column_config={"Link Waze": st.column_config.LinkColumn("Navegar")})

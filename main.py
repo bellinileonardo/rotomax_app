@@ -383,6 +383,17 @@ def get_osrm_distance_value(c1: dict, c2: dict, use_cache: bool = True) -> float
         pass
     return haversine_m(c1, c2)
 
+def format_whatsapp_list(stops):
+    """Formata a lista de paradas para envio via WhatsApp."""
+    text = "🚚 *RotaMax - Lista de Entregas Otimizada*\n\n"
+    for i, stop in enumerate(stops, 1):
+        addr = stop["members"][0]["address"]
+        lat, lng = stop["centroid"]["lat"], stop["centroid"]["lng"]
+        gmaps_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+        text += f"*{i}.* {addr}\n📍 _Link:_ {gmaps_link}\n\n"
+    text += "\n_Gerado por RotaMax_"
+    return quote(text)
+
 def get_street_info(addr: str):
     """Extrai (nome_rua_normalizado, numero) para comparação lógica."""
     # Regex para pegar "Rua Nome, 123" ou "Rua Nome, nº 123"
@@ -1126,8 +1137,10 @@ def build_map(origin: dict, stops: list) -> folium.Map:
     
     if route_geometry:
         folium.GeoJson(route_geometry, name="Rota (Vias)", style_function=lambda x: {"color": "#00e5a0", "weight": 4, "opacity": 0.8}).add_to(m)
-    else:
-        folium.PolyLine(route_coords, color="#00e5a0", weight=3, opacity=0.7, dash_array="10 5").add_to(m)
+
+    # Sempre adiciona a PolyLine como backup ou guia visual (ajustando opacidade se GeoJson existir)
+    folium.PolyLine(route_coords, color="#00b8ff", weight=3, opacity=0.5 if route_geometry else 0.8, dash_array="10 5").add_to(m)
+
 
     # Stop markers
     for i, stop in enumerate(stops, start=1):
@@ -1156,9 +1169,20 @@ def build_map(origin: dict, stops: list) -> folium.Map:
             prefix = f"<b>[{' | '.join(info_p)}]</b> " if info_p else ""
             members_html += f"<li style='margin:2px 0;font-size:12px'>{prefix}{mem['address']}</li>"
 
+        # URLs de navegação para o Popup
+        lat, lng = stop['centroid']['lat'], stop['centroid']['lng']
+        waze_url = build_waze_url(lat, lng)
+        gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}"
+
         popup_html = f"""
-        <b>Parada {i}</b>{'  📦 Agrupada' if stop['is_cluster'] else ''}<br>
-        <ul style='padding-left:14px;margin:6px 0'>{members_html}</ul>
+        <div style="font-family: 'DM Sans', sans-serif; min-width: 200px;">
+            <b style="font-size: 14px; color: #111;">Parada {i}</b>{' <span style="color:#00b8ff; font-size:11px;">📦 Agrupada</span>' if stop['is_cluster'] else ''}<br>
+            <ul style='padding-left:16px; margin:8px 0; font-size: 12px; color: #444; max-height: 100px; overflow-y: auto;'>{members_html}</ul>
+            <div style="display: flex; gap: 8px; margin-top: 10px;">
+                <a href="{waze_url}" target="_blank" style="flex: 1; text-align: center; background-color: #2c3e50; color: white; padding: 10px 5px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 11px;">🚙 Waze</a>
+                <a href="{gmaps_url}" target="_blank" style="flex: 1; text-align: center; background-color: #4285F4; color: white; padding: 10px 5px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 11px;">🗺️ Maps</a>
+            </div>
+        </div>
         """
         
         # HTML Limpo para o ícone (remove quebras de linha para evitar erros de JS no Folium)
@@ -1498,6 +1522,34 @@ with st.sidebar:
         max_k = len(st.session_state.addresses) if st.session_state.addresses else 10
         kmeans_k = st.slider("Número de Paradas (K)", 1, max(2, max_k), max(1, max_k//3))
     
+
+    if st.button("🔄 Otimizar via Sidebar", type="primary", use_container_width=True, help="Aplica os filtros de clusterização e recalcula a rota."):
+        if st.session_state.addresses and st.session_state.origin_coords:
+            with st.spinner("Recalculando..."):
+                # Reutiliza a lógica de geocodificação cacheada
+                session_cache = {p["address"]: p for p in st.session_state.geocoded_points}
+                points = []
+                for addr in st.session_state.addresses:
+                    if addr in session_cache:
+                        points.append(session_cache[addr])
+                    else:
+                        # Tenta geocode rápido se não estiver no cache
+                        coords = geocode(addr, context=city_context)
+                        if coords:
+                            pt_obj = {"address": addr, "coords": {"lat": coords["lat"], "lng": coords["lng"]}, "type": "exact", "display": coords["display"]}
+                            points.append(pt_obj)
+                        else:
+                            points.append({"address": addr, "coords": {"lat": 0.0, "lng": 0.0}, "type": "error"})
+                
+                valid_pts = [p for p in points if p.get("type") != "error"]
+                if valid_pts:
+                    new_clusters = perform_clustering(valid_pts, clustering_algo, cluster_thresh, kmeans_k, min_samples)
+                    st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, new_clusters) if st.session_state.use_tsp else new_clusters
+                    st.session_state.geocoded_points = points
+                    st.session_state.route_ready = True
+                    st.rerun()
+        else:
+            st.error("Adicione endereços e ponto de partida primeiro.")
     st.divider()
     with st.expander(f'Lista de Endereços ({len(st.session_state.addresses)})', expanded=False):
         # ── ADDRESS LIST ─────────────────────────────────────────────────────────
@@ -1549,12 +1601,14 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tab_upload, tab_route, tab_nav, tab_export = st.tabs(["📂 Upload de Planilhas", "🧭 Mapa da Rota", "📍 Botoes Navegação", "🗺 Dados Auxliliares"])
+# ─────────────────────────────────────────────────────────────────────────────
+# FLUID UI FLOW (APK COMPATIBLE)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 1 — UPLOAD & EXTRACTION
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_upload:
+# Se a rota ainda não foi gerada ou se o usuário quiser adicionar novos dados
+if not st.session_state.route_ready:
+    st.markdown('<div class="card-title">Passo 1: Carregar Entregas</div>', unsafe_allow_html=True)
+    
     st.markdown("### Upload de Arquivos")
     
     col_u1, col_u2 = st.columns([2, 1])
@@ -1564,52 +1618,57 @@ with tab_upload:
             type=["pdf", "csv", "xlsx"],
             accept_multiple_files=True,
             help="No celular, prefira enviar poucas imagens por vez para evitar travamentos."
-        )
+        )  
 
     # Consolida as fontes de entrada
     files_to_process = []
     if uploaded:
-        files_to_process.extend(uploaded)
-   
-    if files_to_process:
-        col_proc, col_clear = st.columns([1, 1])
-        with col_proc:
-            do_extract = st.button("⚡ Extrair Endereços", type="primary", width='stretch')
-        with col_clear:
-            if st.button("✕ Limpar Arquivos", width='stretch'):
-                st.session_state.addresses = []
-                files_to_process = []
-                st.rerun()
+        files_to_process.extend(uploaded)   
+    if files_to_process:      
 
-        if do_extract:
-            progress = st.progress(0, text="Iniciando extração…")
-            new_found = []
+        #if do_extract:
+        progress = st.progress(0, text="Iniciando extração…")
+        new_found = []
 
-            for idx, f in enumerate(files_to_process):
-                progress.progress((idx) / len(files_to_process), text=f"Processando {f.name}…")
-                
-                # Lê os bytes uma única vez
-                raw = f.getvalue()
-                file_hash = get_file_hash(raw)
+        for idx, f in enumerate(files_to_process):
+            progress.progress((idx) / len(files_to_process), text=f"Processando {f.name}…")
+            
+            # Lê os bytes uma única vez
+            raw = f.getvalue()
+            file_hash = get_file_hash(raw)
 
-                if f.name.lower().endswith(".csv"):
-                    addrs = extract_addresses_from_csv(raw, f.name)
-                    addrs_norm = [normalize_address(a) for a in addrs]
-                    new_found.extend(addrs_norm)
-                    st.success(f"CSV processado: {len(addrs)} endereços.")
-                    del raw
-                elif f.name.lower().endswith(".xlsx"):
-                    data_list = extract_data_from_xlsx(raw)
-                    count_coords = 0
-                    for item in data_list:
-                        addr = item["address"]
-                        if addr not in st.session_state.addresses:
-                            st.session_state.addresses.append(addr)
-                            # Se já tem coordenadas, injeta direto no cache de geocodificação da sessão
-                            if item["lat"] is not None and item["lng"] is not None:
+            if f.name.lower().endswith(".csv"):
+                addrs = extract_addresses_from_csv(raw, f.name)
+                addrs_norm = [normalize_address(a) for a in addrs]
+                new_found.extend(addrs_norm)
+                st.success(f"CSV processado: {len(addrs)} endereços.")
+                del raw
+            elif f.name.lower().endswith(".xlsx"):
+                data_list = extract_data_from_xlsx(raw)
+                count_coords = 0
+                for item in data_list:
+                    addr = item["address"]
+                    if addr not in st.session_state.addresses:
+                        st.session_state.addresses.append(addr)
+                        # Se já tem coordenadas, injeta direto no cache de geocodificação da sessão
+                        if item["lat"] is not None and item["lng"] is not None:
+                            pt_obj = {
+                                "address": addr,
+                                "coords": {"lat": item["lat"], "lng": item["lng"]},
+                                "type": "exact",
+                                "display": addr,
+                                "extra_info": item.get("extra_info"),
+                                "stop_label": item.get("stop_label"),
+                                "sequence": item.get("sequence")
+                            }
+                            st.session_state.geocoded_points.append(pt_obj)
+                            count_coords += 1
+                        elif item["lat"] is None and item["lng"] is None:
+                            geocoding = geocode(addr)
+                            if geocoding:
                                 pt_obj = {
                                     "address": addr,
-                                    "coords": {"lat": item["lat"], "lng": item["lng"]},
+                                    "coords": {"lat": geocoding["lat"], "lng": geocoding["lng"]},
                                     "type": "exact",
                                     "display": addr,
                                     "extra_info": item.get("extra_info"),
@@ -1617,401 +1676,152 @@ with tab_upload:
                                     "sequence": item.get("sequence")
                                 }
                                 st.session_state.geocoded_points.append(pt_obj)
-                                count_coords += 1
-                            elif item["lat"] is None and item["lng"] is None:
-                                geocoding = geocode(addr)
-                                if geocoding:
-                                    pt_obj = {
-                                        "address": addr,
-                                        "coords": {"lat": geocoding["lat"], "lng": geocoding["lng"]},
-                                        "type": "exact",
-                                        "display": addr,
-                                        "extra_info": item.get("extra_info"),
-                                        "stop_label": item.get("stop_label"),
-                                        "sequence": item.get("sequence")
-                                    }
-                                    st.session_state.geocoded_points.append(pt_obj)
-                    st.success(f"Excel processado: {len(data_list)} endereços ({count_coords} com GPS).")
-                    del raw # Libera memória
-                else:
-                    if provider != "Ollama" and not api_key:
-                        st.markdown('<div class="status-warn">⚠ Chave API necessária para processar imagens.</div>',
-                                    unsafe_allow_html=True)
-                        continue
+                st.toast(f"Excel processado: {len(data_list)} endereços ({count_coords} com GPS).")
+                del raw # Libera memória
+            else:
+                if provider != "Ollama" and not api_key:
+                    st.markdown('<div class="status-warn">⚠ Chave API necessária para processar imagens.</div>',
+                                unsafe_allow_html=True)
+                    continue
 
-                    cached_res = get_cached_addresses(file_hash)
-                    if cached_res is not None:
-                        new_found.extend(cached_res)
-                        st.markdown(f'<div class="status-ok">⚡ Cache "{f.name}" → {len(cached_res)} endereço(s)</div>',
-                                    unsafe_allow_html=True)
-                        time.sleep(0.1)
-                        continue
+                cached_res = get_cached_addresses(file_hash)
+                if cached_res is not None:
+                    new_found.extend(cached_res)
+                    st.markdown(f'<div class="status-ok">⚡ Cache "{f.name}" → {len(cached_res)} endereço(s)</div>',
+                                unsafe_allow_html=True)
+                    time.sleep(0.1)
+                    continue
 
-                    # Processamento sequencial para economizar RAM
-                    if f.name.lower().endswith(".pdf"):
-                        try:
-                            pil_images = convert_from_bytes(raw)
-                            for p_idx, p_img in enumerate(pil_images):
-                                buf = io.BytesIO()
-                                p_img.save(buf, format="JPEG")
-                                page_bytes = optimize_image(buf.getvalue())
-                                
-                                # Extração imediata por página
-                                if provider == "Gemini":
-                                    p_addrs = extract_addresses_from_image_gemini(page_bytes, "image/jpeg", api_key, selected_model)
-                                elif provider == "Ollama":
-                                    p_addrs = extract_addresses_from_image_ollama(page_bytes, "image/jpeg", selected_model, ollama_host)
-                                else:
-                                    p_addrs = extract_addresses_from_image(page_bytes, "image/jpeg", api_key, selected_model)
-                                
-                                p_final = [normalize_address(a) for a in expand_multi_addresses(p_addrs)]
-                                new_found.extend(p_final)
-                                del page_bytes, buf # Limpeza agressiva
-                        except Exception as e:
-                            st.error(f"Erro ao converter PDF {f.name}: {e}")
-                    else:
-                        # Otimiza imagem única
-                        optimized_raw = optimize_image(raw)
-                        issues = check_image_issues(raw)
-                        if issues:
-                            for issue in issues:
-                                st.warning(f"⚠ Alerta em '{f.name}': {issue}")
-
-                        try:
-                            mime = f.type or "image/jpeg"
+                # Processamento sequencial para economizar RAM
+                if f.name.lower().endswith(".pdf"):
+                    try:
+                        pil_images = convert_from_bytes(raw)
+                        for p_idx, p_img in enumerate(pil_images):
+                            buf = io.BytesIO()
+                            p_img.save(buf, format="JPEG")
+                            page_bytes = optimize_image(buf.getvalue())
+                            
+                            # Extração imediata por página
                             if provider == "Gemini":
-                                addrs = extract_addresses_from_image_gemini(optimized_raw, mime, api_key, selected_model)
+                                p_addrs = extract_addresses_from_image_gemini(page_bytes, "image/jpeg", api_key, selected_model)
                             elif provider == "Ollama":
-                                addrs = extract_addresses_from_image_ollama(optimized_raw, mime, selected_model, ollama_host)
+                                p_addrs = extract_addresses_from_image_ollama(page_bytes, "image/jpeg", selected_model, ollama_host)
                             else:
-                                addrs = extract_addresses_from_image(optimized_raw, mime, api_key, selected_model)
+                                p_addrs = extract_addresses_from_image(page_bytes, "image/jpeg", api_key, selected_model)
+                            
+                            p_final = [normalize_address(a) for a in expand_multi_addresses(p_addrs)]
+                            new_found.extend(p_final)
+                            del page_bytes, buf # Limpeza agressiva
+                    except Exception as e:
+                        st.error(f"Erro ao converter PDF {f.name}: {e}")
+                else:
+                    # Otimiza imagem única
+                    optimized_raw = optimize_image(raw)
+                    issues = check_image_issues(raw)
+                    if issues:
+                        for issue in issues:
+                            st.warning(f"⚠ Alerta em '{f.name}': {issue}")
 
-                            addrs_final = [normalize_address(a) for a in expand_multi_addresses(addrs)]
-                            new_found.extend(addrs_final)
-                            save_to_cache(file_hash, addrs_final)
-                        except Exception as e:
-                            st.error(f"Erro na extração ({f.name}): {e}")
-                        
-                        del optimized_raw, raw # Libera memória do arquivo original e otimizado
+                    try:
+                        mime = f.type or "image/jpeg"
+                        if provider == "Gemini":
+                            addrs = extract_addresses_from_image_gemini(optimized_raw, mime, api_key, selected_model)
+                        elif provider == "Ollama":
+                            addrs = extract_addresses_from_image_ollama(optimized_raw, mime, selected_model, ollama_host)
+                        else:
+                            addrs = extract_addresses_from_image(optimized_raw, mime, api_key, selected_model)
 
-
-                time.sleep(0.3)  # small delay between calls
-
-            # Deduplicate and add
-            before = len(st.session_state.addresses)
-            for a in new_found:
-                # Garante normalização final antes de salvar no state (cobre cache e CSV)
-                a = normalize_address(a)
-                if a and a not in st.session_state.addresses:
-                    st.session_state.addresses.append(a)
-
-            added = len(st.session_state.addresses) - before
-            progress.progress(1.0, text="Concluído!")
-            st.success(f"✓ {added} novo(s) endereço(s) adicionado(s). Total: {len(st.session_state.addresses)}")
-
-    # Preview current list
-    if st.session_state.addresses:
-        st.markdown(f"---\n### Lista de Endereços ({len(st.session_state.addresses)})")
-        df_preview = pd.DataFrame({"#": range(1, len(st.session_state.addresses)+1),
-                                   "Endereço": st.session_state.addresses})
-        st.data_editor(df_preview, width='stretch', hide_index=True, on_change=st.rerun)        
-    else:
-        st.markdown('<div class="status-info">ℹ Nenhum endereço ainda. Faça upload ou adicione manualmente na barra lateral.</div>',
-                    unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 2 — ROUTE OPTIMIZATION
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_route:
-    col_tab_route = st.columns(4)
-    with col_tab_route[0]:
-        st.markdown('<div class="card-title">Geração de Roteamento</div>', unsafe_allow_html=True)
-        st.space(8)
-        ready_to_optimize = (
-            len(st.session_state.addresses) > 0
-            and st.session_state.origin_coords is not None
-        )
-
-        if not ready_to_optimize:
-            missing = []
-            if not st.session_state.origin_coords:
-                missing.append("ponto de partida (barra lateral)")
-            if not st.session_state.addresses:
-                missing.append("endereços (aba Upload)")
-            st.markdown(f'<div class="status-warn">⚠ Faltando: {" e ".join(missing)}.</div>',
-                        unsafe_allow_html=True)
-        else:
-            st.toast(f'{len(st.session_state.addresses)} endereço(s) prontos. Clique em Otimizar.')
-    with col_tab_route[1]:
-        pass
-    with col_tab_route[2]:
-        # ── MANUAL EDIT FOR APPROXIMATE ADDRESSES ──────────────────────────────
-        if st.session_state.route_ready and st.session_state.geocoded_points:
-            # Filtra pontos que não são 'exact' ou já foram editados manualmente ('manual')
-            approx_points = [
-                (i, p) for i, p in enumerate(st.session_state.geocoded_points) 
-                if p.get("type") in ["context", "manual", "approx", "error"]
-            ]
-            
-            if approx_points:
-                with st.popover("⚠️ Ajustar Endereços (Aproximados ou Não Encontrados)", width='stretch'):
-                    st.info("Abaixo estão os endereços que precisam de atenção. Corrija o nome ou insira as coordenadas.")
+                        addrs_final = [normalize_address(a) for a in expand_multi_addresses(addrs)]
+                        new_found.extend(addrs_final)
+                        save_to_cache(file_hash, addrs_final)
+                    except Exception as e:
+                        st.error(f"Erro na extração ({f.name}): {e}")
                     
-                    # Lista de endereços válidos para sugestão (fuzzy match)
-                    valid_addrs_for_fuzzy = [
-                        p["address"] for p in st.session_state.geocoded_points 
-                        if p.get("type") not in ["error"] and p["address"]
-                    ]
+                    del optimized_raw, raw # Libera memória do arquivo original e otimizado
 
-                    # Formulário para edição (Endereço e Coordenadas)
-                    with st.form("edit_coords_form"):
-                        for i, pt in approx_points:
-                            status_icon = "❌" if pt.get("type") == "error" else "⚠️"
-                            c1, c2, c3 = st.columns([4, 1, 1])
-                            with c1:
-                                # Agora o endereço é editável
-                                st.text_input(f"{status_icon} Endereço ({i})", value=pt['address'], key=f"txt_{i}")
-                                if pt.get("type") == "error":
-                                    st.caption("Não encontrado. Tente simplificar o endereço (ex: apenas Rua e Número).")
-                                else:
-                                    st.caption(f"Nominatim: {pt.get('display', 'N/A')}")
-                                
-                                # Sugestão de correção (Fuzzy Matching)
-                                if valid_addrs_for_fuzzy:
-                                    suggs = difflib.get_close_matches(pt['address'], valid_addrs_for_fuzzy, n=3, cutoff=0.6)
-                                    # Remove sugestão se for igual ao próprio endereço (caso de approx)
-                                    suggs = [s for s in suggs if s != pt['address']]
-                                    if suggs:
-                                        st.markdown(f"<div style='font-size:0.8em;color:#00b8ff;'>💡 Talvez você quis dizer: <i>{', '.join(suggs)}</i></div>", unsafe_allow_html=True)
 
-                            with c2:
-                                st.number_input(f"Lat ({i})", value=pt["coords"]["lat"], format="%.6f", key=f"lat_{i}")
-                            with c3:
-                                st.number_input(f"Lng ({i})", value=pt["coords"]["lng"], format="%.6f", key=f"lng_{i}")
-                            st.divider()
-                        
-                        if st.form_submit_button("🔄 Atualizar e Recalcular Rota"):
-                            needs_rerun = False
-                            updates_to_save = {}
-                            
-                            # Atualiza geocoded_points com os valores do form
-                            for i, pt in approx_points:
-                                new_text = st.session_state.get(f"txt_{i}")
-                                current_text = pt["address"]
-                                
-                                # Se o texto mudou, tenta re-geocodificar
-                                if new_text and new_text != current_text:
-                                    new_geo = geocode(new_text, context=city_context)
-                                    if new_geo:
-                                        pt["address"] = new_text
-                                        pt["coords"] = {"lat": new_geo["lat"], "lng": new_geo["lng"]}
-                                        pt["type"] = "manual" # Considera resolvido/manual
-                                        pt["display"] = new_geo["display"]
-                                        updates_to_save[new_text] = {
-                                            "lat": new_geo["lat"],
-                                            "lng": new_geo["lng"],
-                                            "type": "manual",
-                                            "display": new_geo["display"]
-                                        }
-                                        continue # Pula a atualização manual de lat/lng pois a geocodificação prevalece
+            time.sleep(0.3)  # small delay between calls
 
-                                # Se o texto não mudou (ou geocode falhou), pega as coords manuais dos inputs
-                                man_lat = st.session_state.get(f"lat_{i}")
-                                man_lng = st.session_state.get(f"lng_{i}")
-                                
-                                if man_lat is not None and man_lng is not None:
-                                    # Verifica se houve mudança nas coordenadas
-                                    if man_lat != pt["coords"]["lat"] or man_lng != pt["coords"]["lng"]:
-                                        pt["coords"]["lat"] = man_lat
-                                        pt["coords"]["lng"] = man_lng
-                                        pt["type"] = "manual"
-                                        updates_to_save[pt["address"]] = {
-                                            "lat": man_lat,
-                                            "lng": man_lng,
-                                            "type": "manual",
-                                            "display": pt.get("display")
-                                        }
-                            
-                            # Salva correções manuais no cache persistente
-                            if updates_to_save:
-                                save_geo_cache(updates_to_save)
-                            
-                            # Recalcula Cluster e TSP (sem geocodificar tudo de novo)
-                            valid_points_refresh = [p for p in st.session_state.geocoded_points if p.get("type") != "error"]
-                            clusters = perform_clustering(valid_points_refresh, clustering_algo, cluster_thresh, kmeans_k, min_samples)
-                            
-                            # Recalcula TSP apenas se estiver ativo
-                            st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, clusters, use_osrm=not st.session_state.use_tsp)
-                            autosave_session() # Salva após edição manual
-                            st.rerun()
-            elif approx_points: # Only show if there were points to adjust, but they are all resolved
-                with st.popover("⚠️ Sem Endereços para Ajustar ", width='stretch', disabled=True):
-                    pass
-    with col_tab_route[3]:
-        # ── RESULTS ─────────────────────────────────────────────────────────────
-        if st.session_state.route_ready and st.session_state.stops and st.session_state.origin_coords:
-            stops = st.session_state.stops
-            origin = st.session_state.origin_coords            
-            # ── MANUAL REORDERING ───────────────────────────────────────────────
-            with st.popover("📝 Reordenar Paradas Manualmente", width='stretch'):
-                st.caption("Edite a coluna 'Ordem' para alterar a sequência.")
-                
-                # Prepara DataFrame para edição
-                reorder_data = []
-                for idx, s in enumerate(stops):
-                    reorder_data.append({
-                        "Ordem": idx + 1,
-                        "Endereço": s["members"][0]["address"],
-                        "Qtd": len(s["members"]),
-                        "_original_idx": idx # Hidden index reference
-                    })
-                
-                df_reorder = pd.DataFrame(reorder_data)
-                edited_df = st.data_editor(df_reorder, hide_index=True, column_config={"_original_idx": None}, disabled=["Endereço Principal", "Qtd"], width='stretch')
-                
-                if st.button("🔄 Aplicar Nova Ordem"):
-                    # Ordena pelo input do usuário e reconstrói a lista de stops
-                    edited_df.sort_values("Ordem", inplace=True)
-                    new_order_indices = edited_df["_original_idx"].tolist()
-                    st.session_state.stops = [st.session_state.stops[i] for i in new_order_indices]
-                    autosave_session() # Salva após reordenar
-                    st.rerun()       
+        # Deduplicate and add
+        before = len(st.session_state.addresses)
+        for a in new_found:
+            # Garante normalização final antes de salvar no state (cobre cache e CSV)
+            a = normalize_address(a)
+            if a and a not in st.session_state.addresses:
+                st.session_state.addresses.append(a)
 
-            # Metrics
-            total_km = total_distance_km(origin, stops)
-            estimated_time_hours = total_km / st.session_state.average_urban_speed_kmh
-            estimated_time_minutes = estimated_time_hours * 60
-            total_addr = sum(len(s["members"]) for s in stops)
-            clusters_count = sum(1 for s in stops if s["is_cluster"])
+        added = len(st.session_state.addresses) - before
+        progress.progress(1.0, text="Concluído!")
+        st.toast(f"✓ {added} novo(s) endereço(s) adicionado(s). Total: {len(st.session_state.addresses)}")
+        
+    # Lista prévia para o usuário conferir antes de otimizar
+    if st.session_state.addresses:
+        st.divider()
+        st.markdown(f"**Endereços Detectados ({len(st.session_state.addresses)})**")
+        for i, addr in enumerate(st.session_state.addresses[:10]): # Mostra só os 10 primeiros para não travar
+            st.caption(f"{i+1}. {addr}")
+        if len(st.session_state.addresses) > 10:
+            st.caption(f"... e mais {len(st.session_state.addresses) - 10} endereços.")
+
+        # Botão Central de Otimização (Gatilho para mudar de "página")
+        ready_to_optimize = st.session_state.origin_coords is not None
+        if not ready_to_optimize:
+            st.warning("⚠️ Defina o Ponto de Partida na barra lateral.")
             
-    
-    if st.session_state.route_ready and st.session_state.stops and st.session_state.origin_coords:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        for col, val, lbl in zip(
-            [c1, c2, c3, c4, c5],
-            [len(stops), total_addr, clusters_count, f"{total_km:.1f} km", 
-             f"{int(estimated_time_hours)}h {int(estimated_time_minutes % 60)}m"],
-            ["Paradas", "Endereços", "Agrupamentos", "Dist. Total", "Tempo Est."],
-        ):
-            with col:
-                st.markdown(f"""<div class="metric-box">
-                    <div class="metric-val">{val}</div>
-                    <div class="metric-lbl">{lbl}</div>
-                </div>""", unsafe_allow_html=True)
-
-    col_mid_tab_route = st.columns(3)
-    with col_mid_tab_route[0]:
-        pass
-    with col_mid_tab_route[1]:
-        pass    
-    with col_mid_tab_route[2]:
-        st.space(15)
-        if st.button("🚀 Otimizar Rota", type="primary", disabled=not ready_to_optimize, key="optimize_route", width='stretch'):
+        if st.button("🚀 Gerar Rota Otimizada", type="primary", use_container_width=True, disabled=not ready_to_optimize):
+            # Lógica de geocodificação e clustering (Consolidada)
             origin = st.session_state.origin_coords
             addrs = st.session_state.addresses
-
-            # Step 1: geocode
-            with st.spinner("Processando endereços..."):
-                # Cache local da sessão anterior para evitar requests repetidos
+            
+            with st.spinner("Geocodificando e Otimizando..."):
                 session_cache = {p["address"]: p for p in st.session_state.geocoded_points}
-                # Cache persistente em arquivo
                 file_cache = load_geo_cache()
-                
-                prog = st.progress(0)
                 points = []
                 new_cache_entries = {}
 
-                for i, addr in enumerate(addrs):
-                    # 1. Prioridade: Cache da Sessão (memória)
-                    if addr in session_cache:
-                        points.append(session_cache[addr])
-                        prog.progress((i+1)/len(addrs), text=f"Cache Memória {i+1}/{len(addrs)}: {addr[:30]}…")
-                        continue
-
-                    # 2. Cache de Arquivo (persistente)
-                    if addr in file_cache:
+                for addr in addrs:
+                    if addr in session_cache: points.append(session_cache[addr])
+                    elif addr in file_cache:
                         data = file_cache[addr]
-                        points.append({
-                            "address": addr,
-                            "coords": {"lat": data["lat"], "lng": data["lng"]},
-                            "type": data.get("type", "approx"),
-                            "display": data.get("display")
-                        })
-                        prog.progress((i+1)/len(addrs), text=f"Cache Disco {i+1}/{len(addrs)}: {addr[:30]}…")
-                        continue
-
-                    # 3. Request API
-                    prog.progress((i+1)/len(addrs), text=f"Geocodificando {i+1}/{len(addrs)}: {addr[:30]}…")
-                    # Passa o contexto da cidade configurado na sidebar
-                    coords = geocode(addr, context=city_context)
-                    if coords:
-                        pt_obj = {
-                            "address": addr, 
-                            "coords": {"lat": coords["lat"], "lng": coords["lng"]},
-                            "type": coords.get("type", "approx"),
-                            "display": coords.get("display")
-                        }
-                        points.append(pt_obj)
-                        
-                        # Prepara para salvar no arquivo
-                        new_cache_entries[addr] = {
-                            "lat": coords["lat"],
-                            "lng": coords["lng"],
-                            "type": coords.get("type", "approx"),
-                            "display": coords.get("display")
-                        }
+                        points.append({"address": addr, "coords": {"lat": data["lat"], "lng": data["lng"]}, "type": data.get("type", "approx"), "display": data.get("display")})
                     else:
-                        st.toast(f"Não geocodificado: {addr}", icon="⚠️", duration='infinite')
-                        # Adiciona como erro para permitir edição manual posterior
-                        points.append({
-                            "address": addr,
-                            "coords": {"lat": 0.0, "lng": 0.0},
-                            "type": "error",
-                            "display": "Não encontrado"
-                        })
-                    time.sleep(0.55)  # Nominatim rate limit
+                        coords = geocode(addr, context=city_context)
+                        if coords:
+                            pt_obj = {"address": addr, "coords": {"lat": coords["lat"], "lng": coords["lng"]}, "type": coords.get("type", "approx"), "display": coords.get("display")}
+                            points.append(pt_obj)
+                            new_cache_entries[addr] = pt_obj
+                        else:
+                            points.append({"address": addr, "coords": {"lat": 0.0, "lng": 0.0}, "type": "error", "display": "Não encontrado"})
+                        time.sleep(0.5)
+
+                if new_cache_entries: save_geo_cache(new_cache_entries)
+                valid_points = [p for p in points if p.get("type") != "error"]
                 
-                # Salva novos dados no disco de uma vez
-                if new_cache_entries:
-                    save_geo_cache(new_cache_entries)
-                    
-                prog.progress(1.0)
-
-            # Filtra apenas pontos válidos para o clustering inicial
-            valid_points = [p for p in points if p.get("type") != "error"]
-
-            if not valid_points and not points:
-                st.error("Nenhum endereço pôde ser geocodificado.")
-            elif not valid_points and points:
-                st.warning("Todos os endereços falharam na geocodificação. Use a seção abaixo para corrigir manualmente.")
-                st.session_state.geocoded_points = points
-                st.session_state.stops = []
-                st.session_state.route_ready = True
-            else:
-                # Step 2: cluster
-                with st.spinner("Agrupando paradas próximas…"):
+                if valid_points:
                     clusters = perform_clustering(valid_points, clustering_algo, cluster_thresh, kmeans_k, min_samples)
-
-                # Step 3: TSP
-                if st.session_state.use_tsp:
-                    with st.spinner("Calculando rota TSP…", show_time=True):
-                        ordered_stops = solve_tsp_nn(origin, clusters)
+                    st.session_state.stops = solve_tsp_nn(origin, clusters) if st.session_state.use_tsp else clusters
+                    st.session_state.geocoded_points = points
+                    st.session_state.route_ready = True
+                    autosave_session()
+                    st.rerun()
                 else:
-                    ordered_stops = clusters
-                    st.info("Otimização TSP desativada. A ordem das paradas segue a ordem de upload.")
+                    st.error("Nenhum endereço válido encontrado.")
 
-                st.session_state.stops = ordered_stops
-                st.session_state.geocoded_points = points
-                st.session_state.route_ready = True
-                autosave_session() # Salva após calcular
-                st.success(f"✓ Rota otimizada! {len(ordered_stops)} parada(s) para {len(points)} ponto(s).")   
+else:
+    # ─────────────────────────────────────────────────────────────────────────────
+    # TELA DO MAPA (Hiding Upload)
+    # ─────────────────────────────────────────────────────────────────────────────
+    c_title, c_back = st.columns([4, 1])
+    with c_title:
+        st.markdown('<div class="card-title">Passo 2: Rota em Execução</div>', unsafe_allow_html=True)
+    with c_back:
+        if st.button("⬅️ Novo", help="Voltar para Upload"):
+            st.session_state.route_ready = False
+            st.rerun()
 
-    st.markdown("---")
     if st.session_state.route_ready and st.session_state.stops and st.session_state.origin_coords:
         with st.container():
             st.markdown("#### 🗺 Mapa da Rota")
-            st.caption("Para corrigir um local, selecione o Marcador (📍) no mapa e clique na posição correta.")
             # Usar session_state diretamente evita o erro de variável não definida (NameError)
             fmap = build_map(st.session_state.origin_coords, st.session_state.stops)
             
@@ -2057,269 +1867,190 @@ with tab_route:
                                     "display": st.session_state.geocoded_points[closest_idx].get("display")
                                 }})
                                 
-                                # Recalcula cluster
-                                if clustering_algo == "DBSCAN":
-                                    new_clusters = cluster_points_dbscan(st.session_state.geocoded_points, eps_m=cluster_thresh, min_samples=min_samples)
-                                elif clustering_algo == "K-Means":
-                                    new_clusters = cluster_points_kmeans(st.session_state.geocoded_points, k=kmeans_k)
-                                else:
-                                    new_clusters = cluster_points(st.session_state.geocoded_points, threshold_m=cluster_thresh)
-
-                                st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, new_clusters)
+                                # Recalcula cluster com nova posição
+                                valid_pts = [p for p in st.session_state.geocoded_points if p.get("type") != "error"]
+                                new_clusters = perform_clustering(valid_pts, clustering_algo, cluster_thresh, kmeans_k, min_samples)
+                                st.session_state.stops = solve_tsp_nn(st.session_state.origin_coords, new_clusters) if st.session_state.use_tsp else new_clusters
                                 autosave_session() # Salva após correção visual
                                 st.rerun()
-  
 
-        col_btn_tab_route = st.columns([1,3,3])
-        with col_btn_tab_route[0]:
-            total_vols = st.number_input("Total de Volumes (Opcional)", min_value=1, value=len(st.session_state.stops), help="Para calcular média de itens por parada")
+        # ── INSTRUÇÕES E NAVEGAÇÃO PONTO A PONTO ──
+        st.divider()
+        tab_labels, tab_export = st.tabs(["📦 Carga", "📊 Dados Auxiliares"])       
 
-        with col_btn_tab_route[1]:
-            st.space(10)
-            with st.popover("📋 Lista de Paradas", width='stretch'):
-                # Input opcional para cálculo de itens por parada
-                stops = st.session_state.stops
-                
-                items_per_stop = math.ceil(total_vols / len(st.session_state.stops))
 
-                for i, stop in enumerate(st.session_state.stops, start=1):
-                    is_done = stop.get("completed", False)
+        with tab_labels:
+            st.markdown("### 🏷️ Etiquetas de Carregamento")
+            st.caption("Organize seus volumes seguindo a ordem das paradas e as zonas do veículo.")
+            
+            # Mapeamento de cores para cada zona
+            zone_colors = {
+                "Banco Carona": "#00b8ff",    # Azul
+                "Banco Traseiro": "#ff9f1c",  # Laranja
+                "Porta-malas (Meio)": "#e5e500", # Amarelo
+                "Porta-malas (Fundo)": "#ff6b35"  # Vermelho/Coral
+            }
+
+            # Agrupamento lógico de itens por zona
+            itens_por_zona = {
+                "Banco Carona": [],
+                "Banco Traseiro": [],
+                "Porta-malas (Meio)": [],
+                "Porta-malas (Fundo)": []
+            }
+            # Usaremos um dicionário temporário para agrupar por stop_label dentro de cada zona
+            grouped_labels_by_zone = {zona: {} for zona in itens_por_zona.keys()}
+            
+            for idx, stop in enumerate(st.session_state.stops, start=1):
+                zona = get_cargo_zone(idx)
+                for member in stop["members"]:
+                    label_id = member.get("stop_label") or member.get("address") # Usar o endereço completo se não houver stop_label
                     
-                    badge_class = "cluster" if stop["is_cluster"] else ""
-                    tag = "📦 Agrupada" if stop["is_cluster"] else "📍 Individual"
-                    if is_done:
-                        tag += " (Concluída)"
-                    members_items = []
-                    for m in stop["members"]:
-                        info_p = []
-                        if m.get("stop_label"): info_p.append(f"Etiqueta: {m['stop_label']}")
-                        if m.get("sequence"): info_p.append(f"Seq: {m['sequence']}")
-                        if m.get("extra_info"): info_p.append(str(m["extra_info"]))
-                        prefix = f"[{' | '.join(info_p)}] " if info_p else ""
+                    if label_id not in grouped_labels_by_zone[zona]:
+                        grouped_labels_by_zone[zona][label_id] = {
+                            "paradas": [],
+                            "sequencias": []
+                        }
+                    grouped_labels_by_zone[zona][label_id]["paradas"].append(idx)
+                    if member.get("sequence"):
+                        grouped_labels_by_zone[zona][label_id]["sequencias"].append(member["sequence"])
 
-                        if m.get("type") in ["approx", "context"]:
-                            members_items.append(f'<div class="addr-sub" style="border-left: 3px solid #ff9f1c; padding-left: 8px;">⚠️ {prefix}{m["address"]} <span style="color:#ff9f1c;font-size:0.7em">(Aprox)</span></div>')
-                        else:
-                            members_items.append(f'<div class="addr-sub">{prefix}{m["address"]}</div>')
-                    members_html = "".join(members_items)
+            # Exibição dos cards por zona
+            for zona, labels_group in grouped_labels_by_zone.items():
+                if labels_group:
+                    st.markdown(f'<div class="card-title">{zona} ({sum(len(data["paradas"]) for data in labels_group.values())} itens)</div>', unsafe_allow_html=True)
+                    cols = st.columns(2)
                     
-                    # Cálculo da Zona de Carga
-                    zone = get_cargo_zone(i)
-                    
-                    icon_status = "✅ " if is_done else ""
-                    with st.expander(f"{icon_status}Parada {i} — {len(stop['members'])} endereço(s) {tag}", expanded=False):
-                        # Botão de Conclusão
-                        btn_label = "↩ Desmarcar Entrega" if is_done else "✅ Marcar como Concluída"
-                        btn_type = "secondary" if is_done else "primary"
-                        if st.button(btn_label, key=f"btn_done_{i}", type=btn_type, use_container_width=True):
-                            stop["completed"] = not is_done
-                            autosave_session()
-                            st.rerun()
+                    # Ordena as etiquetas para exibição consistente
+                    sorted_labels = sorted(labels_group.items(), key=lambda item: item[0])
 
-                        # Botões de navegação rápida
-                        lat, lng = stop['centroid']['lat'], stop['centroid']['lng']
-                        col_waze, col_maps = st.columns(2)
-                        with col_waze:
-                            st.link_button("🚙 Waze", build_waze_url(lat, lng), use_container_width=True)
-                        with col_maps:
-                            st.link_button("🗺 Google Maps", f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}", use_container_width=True)
+                    for i, (label_id, data) in enumerate(sorted_labels):
+                        with cols[i % 2]:
+                            paradas_str = ", ".join(map(str, sorted(set(data["paradas"]))))
+                            seq_str = ", ".join(map(str, sorted(set(data["sequencias"])))) if data["sequencias"] else "N/A"
+                            
+                            # Usa a cor definida para a zona
+                            border_color = zone_colors.get(zona, "#00e5a0") # Fallback para verde
 
-                        st.markdown(f"""<div class="info-card">
-                            <div style='margin-bottom:8px; font-weight:700; color:#ff9f1c; border-bottom:1px solid #333; padding-bottom:4px;'>
-                                📦 Zona: {zone} <span style='font-weight:400; color:#aaa; font-size:0.8em'>({items_per_stop} itens est.)</span>
+                            seq_tag = f" | Seq: {seq_str}" if data["sequencias"] else ""
+                            st.markdown(f"""
+                            <div class="info-card" style="margin-bottom: 8px; padding: 10px; border-left: 3px solid {border_color};">
+                                <div style="font-family: 'Space Mono', monospace; font-size: 0.65rem; color: #5a7090;">Paradas: {paradas_str}{seq_tag}</div>
+                                <div style="font-size: 0.8rem; color: #e8edf5; font-weight: 500; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{label_id}</div>
                             </div>
-                            <div style='font-size:0.75rem;color:#5a7090;font-family:Space Mono,monospace;'>
-                                Lat: {stop['centroid']['lat']:.5f} | Lng: {stop['centroid']['lng']:.5f}
-                            </div>
-                            {members_html}
-                        </div>""", unsafe_allow_html=True)
-          
-        with col_btn_tab_route[2]:            
-            # ── EXPORT PDF BUTTON (MOVED HERE) ──
-            st.space(10)
-            if st.button("📄 Baixar Relatório PDF (HTML)", width='stretch', type="primary"):
-                # 1. Gera o mapa
-                m_report = build_map(st.session_state.origin_coords, st.session_state.stops)
-                full_html = m_report.get_root().render()
+                            """, unsafe_allow_html=True)
+                else:
+                    st.caption(f"Zona {zona} está vazia.")
 
-                # Preparação para o Plano de Etiquetas por Zona no Relatório
-                labels_by_zone_pdf = {
-                    "Banco Carona": [],
-                    "Banco Traseiro": [],
-                    "Porta-malas (Meio)": [],
-                    "Porta-malas (Fundo)": []
-                }
+        with tab_export:
+            stops = st.session_state.stops
+            origin = st.session_state.origin_coords
+            total_km = total_distance_km(origin, stops)
+            total_addr = sum(len(s["members"]) for s in stops)
+            clusters_count = sum(1 for s in stops if s["is_cluster"])
+            estimated_time_hours = total_km / st.session_state.average_urban_speed_kmh
+            estimated_time_minutes = estimated_time_hours * 60
 
-                # 2. Constrói o HTML da lista
-                rows_html = ""
-                for i, stop in enumerate(stops, start=1):
-                    current_zone = get_cargo_zone(i)
-                    addr_items = []
-                    for mem in stop['members']:
-                        if mem.get("stop_label"):
-                            labels_by_zone_pdf[current_zone].append(str(mem["stop_label"]))
+            # ── 1. MÉTRICAS DETALHADAS ──
+            c1, c2, c3, c4, c5 = st.columns(5)
+            metrics = [
+                (len(stops), "Paradas"),
+                (total_addr, "Endereços"),
+                (clusters_count, "Agrupamentos"),
+                (f"{total_km:.1f} km", "Dist. Total"),
+                (f"{int(estimated_time_hours)}h {int(estimated_time_minutes % 60)}m", "Tempo Est.")
+            ]
+            for col, (val, lbl) in zip([c1, c2, c3, c4, c5], metrics):
+                with col:
+                    st.markdown(f'<div class="metric-box"><div class="metric-val">{val}</div><div class="metric-lbl">{lbl}</div></div>', unsafe_allow_html=True)
+            
+            st.divider()
 
-                        # Destaque para Etiqueta e Sequência no Relatório
-                        info_badges = ""
-                        if mem.get("stop_label"):
-                            info_badges += f'<span style="background:#00b8ff; color:white; padding:1px 5px; border-radius:3px; font-weight:bold; font-size:0.75em; margin-right:5px;">Etiqueta: {mem["stop_label"]}</span>'
-                        if mem.get("sequence"):
-                            info_badges += f'<span style="background:#f3f4f6; color:#4b5563; border:1px solid #d1d5db; padding:1px 5px; border-radius:3px; font-size:0.75em; margin-right:5px;">Seq: {mem["sequence"]}</span>'
+            # ── 2. GRÁFICO DE CARGA ──
+            st.markdown("#### 📊 Distribuição de Carga")
+            zone_stats = [{"Zona": get_cargo_zone(idx+1), "Volumes": len(s["members"])} for idx, s in enumerate(stops)]
+            df_zones = pd.DataFrame(zone_stats).groupby("Zona")["Volumes"].sum().reset_index()
+            st.bar_chart(df_zones, x="Zona", y="Volumes", color="Zona")
 
-                        safe_addr = quote(mem['address'])
-                        waze_link = f"https://waze.com/ul?ll={mem['coords']['lat']}%2C{mem['coords']['lng']}&navigate=yes"
-                        gmaps_link = f"https://www.google.com/maps/search/?api=1&query={safe_addr}"
-                        links_html = f"""<span style="margin-left:6px; font-size:0.75em;"><a href="{waze_link}" target="_blank" style="text-decoration:none; color:#333; border:1px solid #ccc; padding:0 3px; border-radius:3px;">Waze</a> <a href="{gmaps_link}" target="_blank" style="text-decoration:none; color:#333; border:1px solid #ccc; padding:0 3px; border-radius:3px;">Maps</a></span>"""
-                        addr_items.append(f"<li>{info_badges}{mem['address']}{links_html}</li>")
-                    
-                    addr_list = "".join(addr_items)
-                    tag_color = "#00b8ff" if stop["is_cluster"] else "#00e5a0"
-                    rows_html += f"""
-                    <div class="stop-card">
-                        <div class="stop-num" style="background: {tag_color};">{i}</div>
-                        <div class="stop-content">
-                            <div class="stop-title">{'📦 Agrupamento' if stop['is_cluster'] else '📍 Parada Individual'}</div>
-                            <div style="font-size:0.8rem; font-weight:bold; color:#e67e22; margin-bottom:4px;">📦 Zona: {current_zone}</div>
-                            <ul class="addr-ul">{addr_list}</ul>
-                        </div>
-                    </div>
-                    """
+            st.divider()
 
-                # Constrói a seção de etiquetas agrupadas para o relatório
-                cargo_plan_html = '<div class="cargo-plan"><h3>📋 Etiquetas por Compartimento</h3><div class="cargo-grid">'
-                for zone_name, labels in labels_by_zone_pdf.items():
-                    labels_list = "".join([f"<span>{l}</span>" for l in labels]) if labels else "<i>Vazio</i>"
-                    cargo_plan_html += f"""
-                    <div class="cargo-box-item">
-                        <strong>{zone_name}</strong>
-                        <div class="labels-container">{labels_list}</div>
-                    </div>"""
-                cargo_plan_html += '</div></div>'
+            # ── 3. AÇÕES E EXPORTAÇÃO ──
+            st.markdown("#### 🛠️ Ações e Exportação")
+            col_exp1, col_exp2 = st.columns(2)
+            
+            with col_exp1:
+                # Relatório PDF/HTML
+                if st.button("📄 Gerar Relatório Completo", type="primary", use_container_width=True):
+                    with st.spinner("Renderizando relatório..."):
+                        m_report = build_map(origin, stops)
+                        full_html = m_report.get_root().render()
+                        
+                        # Preparação dos dados para o relatório HTML
+                        labels_by_zone_pdf = {"Banco Carona": [], "Banco Traseiro": [], "Porta-malas (Meio)": [], "Porta-malas (Fundo)": []}
+                        rows_html = ""
+                        for i, stop in enumerate(stops, start=1):
+                            current_zone = get_cargo_zone(i)
+                            addr_items = ""
+                            for mem in stop['members']:
+                                if mem.get("stop_label"): labels_by_zone_pdf[current_zone].append(str(mem["stop_label"]))
+                                addr_items += f"<li>{mem['address']}</li>"
+                            
+                            tag_color = "#00b8ff" if stop["is_cluster"] else "#00e5a0"
+                            rows_html += f'<div style="display:flex; border-bottom:1px solid #eee; padding:10px;"><div style="background:{tag_color}; color:white; width:30px; height:30px; border-radius:50%; text-align:center; line-height:30px; margin-right:15px; flex-shrink:0;">{i}</div><div><b>{current_zone}</b><ul>{addr_items}</ul></div></div>'
 
-                # Visualização do Carro
-                n_stops = len(stops)
-                z1_on = "active" if n_stops >= 1 else ""
-                z2_on = "active" if n_stops >= 9 else ""
-                z3_on = "active" if n_stops >= 21 else ""
-                z4_on = "active" if n_stops >= 35 else ""
+                        # HTML Content (Simples para compatibilidade APK)
+                        custom_content = f"""
+                        <div id="report-container" style="padding:20px; font-family:sans-serif;">
+                            <h1>Relatório RotaMax</h1>
+                            <p>Paradas: {len(stops)} | Distância: {total_km:.1f}km</p>
+                            <div class="rep-list">{rows_html}</div>
+                        </div>"""
+                        
+                        final_html = full_html.replace("</body>", f"{custom_content}</body>")
+                        st.download_button("⬇ Baixar Relatório (HTML)", data=final_html, file_name=f"RotaMax_{datetime.now().strftime('%d%m_%H%M')}.html", mime="text/html", use_container_width=True)
+
+            with col_exp2:
+                # Google Maps link
+                gmaps_url = build_gmaps_url(origin, stops)
+                st.link_button("🌐 Abrir Rota no Google Maps", gmaps_url, use_container_width=True)
+
+                # WhatsApp Share
+                wa_text = format_whatsapp_list(stops)
+                st.link_button("💬 Compartilhar via WhatsApp", f"https://wa.me/?text={wa_text}", use_container_width=True)
+
+            # Botões de dados brutos
+            st.markdown("---")
+            col_raw1, col_raw2, col_raw3 = st.columns(3)
+            
+            # Preparação do DataFrame de Paradas
+            stops_data = []
+            for i, s in enumerate(stops, 1):
+                stops_data.append({
+                    "Parada": i,
+                    "Endereço Principal": s["members"][0]["address"],
+                    "Volumes": len(s["members"]),
+                    "Zona": get_cargo_zone(i),
+                    "Lat": s["centroid"]["lat"],
+                    "Lng": s["centroid"]["lng"]
+                })
+            df_stops = pd.DataFrame(stops_data)
+
+            with col_raw1:
+                csv = df_stops.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Baixar CSV", csv, "paradas.csv", "text/csv", use_container_width=True)
+            
+            with col_raw2:
+                json_str = json.dumps(stops, indent=2, ensure_ascii=False).encode('utf-8')
+                st.download_button("📥 Baixar JSON", json_str, "rota_data.json", "application/json", use_container_width=True)
                 
-                car_html = f"""
-                <div class="car-box">
-                    <h3>🚗 Esquema de Carregamento</h3>
-                    <div class="car-layout">
-                        <div class="car-row"><div class="car-seat driver">Motorista</div><div class="car-seat {z1_on}"><div class="z-name">Banco Carona</div><div class="z-range">1-8</div></div></div>
-                        <div class="car-row"><div class="car-seat full {z2_on}"><div class="z-name">Banco Traseiro</div><div class="z-range">9-20</div></div></div>
-                        <div class="car-row trunk-area"><div class="car-seat half {z3_on}"><div class="z-name">Meio</div><div class="z-range">21-34</div></div><div class="car-seat half {z4_on}"><div class="z-name">Fundo</div><div class="z-range">35+</div></div></div>
-                    </div>
-                </div>
-                """
+            with col_raw3:
+                if st.button("🗑️ Resetar Tudo", help="Limpa todos os endereços e rotas", use_container_width=True):
+                    st.session_state.addresses = []
+                    st.session_state.stops = []
+                    st.session_state.route_ready = False
+                    st.rerun()
 
-                custom_content = f"""
-                <div id="report-container">
-                    <div class="rep-header"><h1>Relatório RotaMax</h1><p>Partida: {origin.get('label','GPS')} • Paradas: {len(st.session_state.stops)}</p></div>
-                    {car_html}{cargo_plan_html}<div class="rep-list">{rows_html}</div>
-                </div>
-                <style>
-                    html,body{{height:auto!important;overflow:visible!important;}} .folium-map{{position:relative!important;height:450px!important;width:100%!important;border-bottom:5px solid #111827;}}
-                    #report-container{{padding:20px;font-family:'Segoe UI',sans-serif;background:white;color:#111;}}
-                    .stop-card{{display:flex;border-bottom:1px solid #eee;padding:12px 0;page-break-inside:avoid;}}
-                    .stop-num{{font-size:1.2rem;font-weight:bold;color:#fff;width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-right:15px;flex-shrink:0;-webkit-print-color-adjust:exact;}}
-                    .car-box{{margin-bottom:20px;padding:15px;background:#f9f9f9;border:1px solid #eee;border-radius:8px;page-break-inside:avoid;}}
-                    .car-layout{{display:flex;flex-direction:column;gap:5px;max-width:320px;margin:0 auto;border:2px solid #555;padding:10px;background:white;}} .car-row{{display:flex;gap:5px;}} .car-seat{{flex:1;border:1px solid #ccc;background:#f0f0f0;padding:8px;text-align:center;border-radius:4px;font-size:0.8rem;}} .car-seat.active{{background:#d1fae5;border:1px solid #10b981;font-weight:bold;}}
-                    .cargo-plan {{ margin-bottom: 25px; page-break-inside: avoid; }}
-                    .cargo-grid {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
-                    .cargo-box-item {{ flex: 1; min-width: 140px; border: 1px solid #ddd; padding: 10px; border-radius: 6px; background: #fafafa; }}
-                    .cargo-box-item strong {{ display: block; border-bottom: 1px solid #eee; margin-bottom: 5px; font-size: 0.8rem; color: #333; }}
-                    .labels-container {{ font-family: monospace; font-size: 0.7rem; color: #444; display: flex; flex-wrap: wrap; gap: 4px; }} .labels-container span {{ background: #e2e8f0; padding: 2px 4px; border-radius: 3px; border: 1px solid #cbd5e1; }}
-                </style>"""
-                final_html = full_html.replace("</body>", f"{custom_content}</body>")
-                st.download_button("⬇ Baixar HTML", data=final_html, file_name="Relatorio.html", mime="text/html", width='stretch')
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 3 — NAVEGAÇÃO
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_nav:
-    st.markdown("### 📍 Navegação Ponto a Ponto")
-    
-    if not st.session_state.route_ready or not st.session_state.stops:
-        st.markdown('<div class="status-warn">⚠ Gere a rota primeiro na aba "Rota Otimizada".</div>',
-                    unsafe_allow_html=True)
-    else:
-        stops = st.session_state.stops
-        nav_tabs = st.tabs(["🚘 Lista Waze", "🗺 Lista Google Maps"])
-        
-        with nav_tabs[0]:
-            st.caption("Clique para abrir diretamente no Waze:")
-            for i, stop in enumerate(stops, start=1):
-                lat, lng = stop["centroid"]["lat"], stop["centroid"]["lng"]
-                main_addr = stop["members"][0]["address"]
-                waze_url = build_waze_url(lat, lng)
-                # Botão full width para facilitar o toque no celular
-                col_tab_nav_btn = st.columns(2)
-                with col_tab_nav_btn[0]:
-                    st.markdown(f":yellow-background[{main_addr} ] ", width='stretch')
-                with col_tab_nav_btn[1]:
-                    st.link_button(f"🚀 Navegar | Parada: {i}", waze_url, width='stretch')
-        
-        with nav_tabs[1]:
-            st.caption("Clique para abrir navegação no Google Maps:")
-            for i, stop in enumerate(stops, start=1):
-                lat, lng = stop["centroid"]["lat"], stop["centroid"]["lng"]
-                main_addr = stop["members"][0]["address"]
-                gmaps_url = f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}"
-                st.link_button(f"📍 Parada {i} | {main_addr}", gmaps_url, use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 4 — EXPORT
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_export:
-    if not st.session_state.route_ready:
-        st.markdown('<div class="status-warn">⚠ Gere a rota primeiro na aba "Rota Otimizada".</div>',
-                    unsafe_allow_html=True)
-    else:
-        stops = st.session_state.stops
-        origin = st.session_state.origin_coords
-
-        # ── CHART: LOAD DISTRIBUTION ──────────────────────────────────────
-        st.markdown("#### 📊 Distribuição de Carga no Veiculo")
-        
-        # Prepara dados para o gráfico
-        zone_stats = []
-        labels_by_zone = {
-            "Banco Carona": [],
-            "Banco Traseiro": [],
-            "Porta-malas (Meio)": [],
-            "Porta-malas (Fundo)": []
-        }
-        for i, stop in enumerate(stops, start=1):
-            z = get_cargo_zone(i)
-            # Conta itens (membros) nesta parada
-            zone_stats.append({"Zona": z, "Volumes": len(stop["members"])})
-            for m in stop["members"]:
-                if m.get("stop_label"):
-                    labels_by_zone[z].append(str(m["stop_label"]))
-        
-        if zone_stats:
-            df_zones = pd.DataFrame(zone_stats)
-            # Agrupa e soma volumes por zona
-            df_chart = df_zones.groupby("Zona")["Volumes"].sum().reset_index()
-            
-            # Ordem lógica das zonas para o eixo X
-            zone_order = ["Banco Carona", "Banco Traseiro", "Porta-malas (Meio)", "Porta-malas (Fundo)"]
-            
-            st.bar_chart(df_chart, x="Zona", y="Volumes", color="Zona", width='stretch')
-            
-            st.markdown("#### 📋 Etiquetas por Compartimento")
-            cols_z = st.columns(4)
-            for idx, zone_name in enumerate(zone_order):
-                with cols_z[idx]:
-                    etiquetas = labels_by_zone.get(zone_name, [])
-                    st.markdown(f"**{zone_name}**")
-                    if etiquetas:
-                        # Exibe como uma lista formatada
-                        st.code("\n".join(etiquetas), language=None)
-                    else:
-                        st.caption("Nenhuma etiqueta")
+with st.sidebar:
+    st.caption("DEBUG SESSION STATE")
+    if st.checkbox("Ver Estado"):
+        st.write(st.session_state)
